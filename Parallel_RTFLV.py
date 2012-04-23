@@ -44,6 +44,8 @@ def read_tags (stream):
     while (True):
         # type, size, timestamp, streamid
         data = stream.read (1 + 3 + 3 + 4)
+        if (len (data) != 11):
+            break
         
         _type = data[0]
         size = struct.unpack ("!I", "\x00" + data[1 : 4])[0]
@@ -51,11 +53,12 @@ def read_tags (stream):
         streamid = struct.unpack ("!I", data[7 : 11])[0]
         
         body = stream.read (size)
-        data += body + stream.read (4)
-        fullsize = struct.unpack ("!I", data[-4 : ])[0]
-        
-        if (len (data) == 0):
+        fullsize = stream.read (4)
+        if (len (body) != size or len (fullsize) != 4):
             break
+        data += body + fullsize
+        fullsize = struct.unpack ("!I", fullsize)[0]
+        
         yield (data, _type, timestamp, body)
 
 #
@@ -66,7 +69,7 @@ def read_tags (stream):
 #       Returns:        @data, but with @timestamp as the timestamp
 #
 def set_tag_timestamp (data, timestamp):
-    return data[0 : 4] + struct.pack ("!I", timestamp)[1 : ] + data[7 : 11]
+    return data[0 : 4] + struct.pack ("!I", timestamp)[1 : ] + data[7 : ]
 
 #
 #       save_stream_part:
@@ -82,11 +85,11 @@ def set_tag_timestamp (data, timestamp):
 #       filename.part(@part) (e.g. john.flv.part3) of the given @duration.
 #       
 #       The function will return if it receives -1 on @inqueue.
-#       The function will report its status via @outqueue with a
-#       dict.
+#       The function will report its status and 0<=progress<=1
+#       via @outqueue with a dict.
 #
-def save_stream_part (url, filename, duration, part,
-                      inqueue, outqueue, report_time):
+def save_stream_part (url, filename, part,
+                      inqueue, outqueue):
     stream = urllib2.urlopen (url)
     
     # non-flv: fail
@@ -99,27 +102,60 @@ def save_stream_part (url, filename, duration, part,
     
     # read the one header ...
     header = read_header (stream)
-    outfile.write (header)
+    if (part == 0):
+        outfile.write (header)
     
-    last_report = 0
     # timestamps start at 0 no matter what so
     # need to offset timestamps
-    offset = duration * part / 1000
+    offset = 0
+    # end_time specifies the absolute end of this segment
+    end_time = float ("inf")
+    # duration specifies the relative end of this segment
+    duration = (end_time - offset) * 1000
     
     # ... and read all the tags
     for data, _type, timestamp, body in read_tags (stream):
-        # write to file if part0 or not metadata
-        if (_type != "\x12" or part == 0):
-            set_tag_timestamp (data, timestamp + offset)
+        do_write = True
+        
+        if (_type == "\x12"):
+            do_write = False
+            
+            # the timeBase in a metadata tag indicates the ACTUAL
+            # starting time of this segment - use this as offset
+            timeBase = body.find ("timeBase")
+            if (timeBase != -1 and timestamp == 0):
+                index = timeBase + len ("timeBase") + 1
+                timeBase = body[index : index + 8]
+                offset = struct.unpack ("!d", timeBase)[0]
+                # new offset -> re-calculate duration
+                duration = (end_time - offset) * 1000
+                # put timeBase - the segment before this one will
+                # need to use it as the end point
+                outqueue.put ({"part" : part, "offset" : offset})
+        elif (_type == "\x08"):
+            if ((ord (body[0]) >> 4) == 10):
+                # aac sequence header - only write if first part
+                do_write = (body[1] != "\x00")
+        elif (_type == "\x09"):
+            if ((ord (body[0]) & 0xf) == 7):
+                # avc sequence header - only write if first part
+                do_write = (body[1] != "\x00")
+        
+        # write to file if first part or not metadata/sequence header
+        if (do_write or part == 0):
+            data = set_tag_timestamp (data, timestamp + offset * 1000)
             outfile.write (data)
+        
         # reached @duration ?
         if (timestamp >= duration):
             break
         
-        # report, if its time to
-        if (timestamp >= (last_report + report_time) ):
-            last_report = timestamp
-            outqueue.put ({"part" : part, "timestamp" : timestamp})
+        # report progress
+        if (duration == float ("inf") ):
+            progress = 0
+        else:
+            progress = timestamp / duration
+        outqueue.put ({"part" : part, "progress" : progress})
         
         try:
             message = inqueue.get_nowait ()
@@ -129,6 +165,9 @@ def save_stream_part (url, filename, duration, part,
                 stream.close ()
                 outqueue.put ({"part" : part, "status" : "Failed"})
                 return
+            # otherwise, message is a new end_time -> re-calculate duration
+            end_time = message
+            duration = (end_time - offset) * 1000
         except Queue.Empty:
             pass
     # finished reading all that's needed - success!
@@ -151,7 +190,7 @@ def save_stream_part (url, filename, duration, part,
 #       
 #       Yields:         download stats - same as in save_stream_part()
 #
-def save_stream (url_fn, filename, duration, parts = 3, report_time = 500):
+def save_stream (url_fn, filename, duration, parts = 3):
     # list of [thread, queue, finished?]
     threads = list ()
     inqueue = Queue.Queue ()
@@ -162,14 +201,16 @@ def save_stream (url_fn, filename, duration, parts = 3, report_time = 500):
         # url for this part
         part_url = url_fn (i * part_duration)
         thread = Thread (target = save_stream_part,
-                         args = (part_url, filename, part_duration * 1000, i,
-                                 outqueue, inqueue, report_time) )
-        threads.append ([thread, outqueue, False])
+                         args = (part_url, filename, i,
+                                 outqueue, inqueue) )
+        threads.append ([thread, outqueue, False, -1])
         thread.daemon = True
         thread.start ()
+    threads[-1][1].put (duration)
     
     while (True):
         message = inqueue.get ()
+        part = message["part"]
         
         if ("status" in message):
             status = message["status"]
@@ -183,8 +224,13 @@ def save_stream (url_fn, filename, duration, parts = 3, report_time = 500):
             
             # this part is done, check if all others are done too
             if (status == "Done"):
-                threads[message["part"]][2] = True
+                threads[part][2] = True
                 if (all (x[2] for x in threads) ):
                     yield message
                     break
+        
+        if ("offset" in message):
+            # got an offset for part: this is end_time for part-1
+            if (part > 0):
+                threads[part - 1][1].put (message["offset"])
         yield message

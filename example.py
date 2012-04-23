@@ -18,6 +18,7 @@
 #
 
 import sys
+import shutil
 from Parallel_RTFLV import save_stream
 
 if (len (sys.argv) < 3):
@@ -47,9 +48,8 @@ for message in save_stream (url_fn, outfile, duration, parts):
         if (status == "Failed"):
             print "\nDownload of part {} failed. Aborting...".format (part)
 
-    if ("timestamp" in message):
-        part_progress = message["timestamp"] * parts / duration / 10.0
-        progress[part] = "{:<9}".format (part_progress)
+    if ("progress" in message):
+        progress[part] = "{:<9.2f}".format (message["progress"] * 100)
     
     # print out the stats
     print "\r" + " ".join (progress),

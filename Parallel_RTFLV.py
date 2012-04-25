@@ -15,7 +15,14 @@ import shutil
 import urllib2
 import struct
 import Queue
-from threading import Thread
+from threading import Thread, Lock
+
+print_lock = Lock ()
+
+def print_obj (obj):
+    print_lock.acquire ()
+    print obj
+    print_lock.release ()
 
 #
 #       read_header:
@@ -97,6 +104,7 @@ def get_metadata_number (metadata, key):
 #       @part:          which number part this is
 #       @inqueue:       #Queue to receive input from
 #       @outqueue:      #Queue to send output to
+#       @debug:         Print debug messages
 #
 #       Downloads a part of an FLV stream given in @url to
 #       @filename
@@ -107,19 +115,43 @@ def get_metadata_number (metadata, key):
 #       status=1 if download finished
 #       status=-1 if download failed
 #
-def save_stream_part (url, filename, part, inqueue, outqueue):
-    stream = urllib2.urlopen (url)
+def save_stream_part (url, filename, part, inqueue, outqueue, debug):
+    if (debug):
+        print_obj ("Part {}: Opening {}".format (part, url) )
+    try:
+        stream = urllib2.urlopen (url)
+    except IOError as e:
+        print_obj ("Part {0}: Failed to open {1}\n"
+                   "Part {0}: {2}\n"
+                   "Part {0}: Aborting".format (part, url, e) )
+        outqueue.put ({"part" : part, "status" : -1})
+        return
     # non-flv: fail
     if (stream.info ().gettype () != "video/x-flv"):
         stream.close ()
+        if (debug):
+            print_obj ("Part {}: {} is {} not FLV".format (
+                part, url, stream.info ().gettype () ) )
         outqueue.put ({"part" : part, "status" : -1})
         return
     
     outfile = open (filename, "w")
+    if (debug):
+        print_obj ("Part {}: Created {}".format (part, filename) )
     # read the one header ...
     header = read_header (stream)
+    if (len (header) != 13):
+        if (debug):
+            print_obj ("Part {}: FLV header (+ tag size) "
+                       "is NOT 13 bytes. Aborting".format (part) )
+        outqueue.put ({"part" : part, "status" : -1})
+        return
+    if (debug):
+        print_obj ("Part {}: Read FLV header".format (part) )
     if (part == 0):
         outfile.write (header)
+        if (debug):
+            print_obj ("Part {}: Wrote FLV header".format (part) )
     
     # timestamps start at 0 no matter what so
     # need to offset timestamps
@@ -143,6 +175,10 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
                     filesize = get_metadata_number (body, "filesize")
                     
                     if (full_duration != None and filesize != None):
+                        if (debug):
+                            print_obj ("Part {}: Found duration ({}), "
+                                    "filesize ({})".format (
+                                    part, full_duration, filesize ) )
                         outqueue.put ({"full-duration" : full_duration,
                                        "filesize" : filesize})
                 
@@ -152,7 +188,14 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
                 if (new_offset != None):
                     offset = new_offset
                     duration = (end_time - offset) * 1000
+                    if (debug):
+                        print_obj ("Part {}: Found timeBase ({}) "
+                                   "- new duration ({})".format (
+                                   part, offset, duration) )
                     outqueue.put ({"part" : part, "offset" : offset})
+            elif (debug):
+                print_obj ("Part {}: Ignoring new metadata at {}".format (
+                           part, timestamp) )
         elif (_type == "\x08"):
             if ((ord (body[0]) >> 4) == 10):
                 # aac sequence header - only write if first part
@@ -169,6 +212,8 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
         
         # reached @duration ?
         if (timestamp >= duration):
+            if (debug):
+                print_obj ("Part {}: Finished at {}".format (part, duration) )
             break
         
         # report progress for audio, video tags
@@ -183,6 +228,8 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
             message = inqueue.get_nowait ()
             if (message == -1):
                 # we've been told to stop, so fail
+                if (debug):
+                    print_obj ("Part {}: Aborting".format (part) )
                 outfile.close ()
                 stream.close ()
                 outqueue.put ({"part" : part, "status" : -1})
@@ -190,11 +237,17 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
             # otherwise, message is a new end_time
             end_time = message
             duration = (end_time - offset) * 1000
+            if (debug):
+                print_obj ("Part {}: Got new end_time ({}) "
+                           "- new duration ({})".format (
+                           part, end_time, duration) )
         except Queue.Empty:
             pass
     # finished reading all that's needed - success!
     outfile.close ()
     stream.close ()
+    if (debug):
+        print_obj ("Part {}: Done".format (part) )
     outqueue.put ({"part" : part, "status" : 1})
 
 #
@@ -204,6 +257,7 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
 #       @parts:         number of parts in which to download FLV
 #       @mainqueue:     queue to put messages on
 #       @duration:      total duration of FLV to download
+#       @debug:         Print debug messages
 #
 #       Downloads the FLV stream from @url_fn in several parts and save to
 #       @filename.
@@ -221,7 +275,7 @@ def save_stream_part (url, filename, part, inqueue, outqueue):
 #       into @filename (and then deleted).
 #
 def save_stream (url_fn, filename, parts = 3,
-                 mainqueue = None, duration = float ("inf")):
+                 mainqueue = None, duration = float ("inf"), debug = False):
     # list of [thread, queue, finished?]
     threads = list ()
     inqueue = Queue.Queue ()
@@ -232,14 +286,18 @@ def save_stream (url_fn, filename, parts = 3,
     part_url = url_fn (0)
     thread = Thread (target = save_stream_part,
                      args = (url_fn (0), filename, 0,
-                             outqueue, inqueue) )
+                             outqueue, inqueue, debug) )
     threads.append ([thread, outqueue, False])
     thread.daemon = True
     thread.start ()
+    if (debug):
+        print_obj ("Part 0 started")
     
     # expecting first message with filesize, duration; error otherwise
     message = inqueue.get ()
     if ("filesize" not in message or "full-duration" not in message):
+        if (debug):
+            print_obj ("Found no filesize, duration metadata. Aborting")
         if (mainqueue != None):
             mainqueue.put (-1)
         return
@@ -248,6 +306,8 @@ def save_stream (url_fn, filename, parts = 3,
         mainqueue.put ({"duration" : duration,
                         "filesize" : message["filesize"]})
     
+    if (debug):
+        print_obj ("Starting all other parts")
     # now that we have duration, we can start all other parts
     part_duration = duration / parts
     for i in range (1, parts):
@@ -257,10 +317,12 @@ def save_stream (url_fn, filename, parts = 3,
         part_filename = filename + ".part" + str (i)
         thread = Thread (target = save_stream_part,
                          args = (part_url, part_filename, i,
-                                 outqueue, inqueue) )
+                                 outqueue, inqueue, debug) )
         threads.append ([thread, outqueue, False])
         thread.daemon = True
         thread.start ()
+        if (debug):
+            print_obj ("Part {} started".format (i) )
     # add 0.5 just in case
     threads[-1][1].put (duration + 0.5)
     
@@ -272,6 +334,8 @@ def save_stream (url_fn, filename, parts = 3,
             status = message["status"]
             # this part failed, so abort all
             if (status == -1):
+                if (debug):
+                    print_obj ("Part {} failed. Aborting".format (part) )
                 for i in threads:
                     i[1].put (-1)
                 if (mainqueue != None):
@@ -283,9 +347,13 @@ def save_stream (url_fn, filename, parts = 3,
                 threads[part][2] = True
                 if (all (x[2] for x in threads) ):
                     message["status"] = 2
+                    if (debug):
+                        print_obj ("All parts done")
                     if (mainqueue != None):
                         mainqueue.put (message)
                     break
+                if (debug):
+                    print_obj ("Part {} done".format(part) )
         
         if ("offset" in message):
             # got an offset for part: this is end_time for part-1
@@ -294,6 +362,8 @@ def save_stream (url_fn, filename, parts = 3,
         if (mainqueue != None):
             mainqueue.put (message)
     
+    if (debug):
+        print_obj ("Starting to join files")
     # join all files and delete partials
     # first part is contained in @filename
     # others in @filename.partX
@@ -304,6 +374,12 @@ def save_stream (url_fn, filename, parts = 3,
         partfile = open (part_filename, "r")
         shutil.copyfileobj (partfile, ofile)
         partfile.close ()
+        if (debug):
+            print_obj ("Appended part {} : {}".format (i, part_filename) )
         
         os.remove (part_filename)
+        if (debug):
+            print_obj ("Deleted part {}  : {}".format (i, part_filename) )
     ofile.close ()
+    if (debug):
+        print_obj ("Joining done")

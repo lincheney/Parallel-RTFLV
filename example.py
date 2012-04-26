@@ -18,9 +18,9 @@
 import sys
 from threading import Thread
 import Queue
-from Parallel_RTFLV import save_stream
+from Parallel_RTFLV import save_stream, FAIL, SUCCESS, ALL_PARTS_DONE
 
-if (len (sys.argv) < 2):
+if (len (sys.argv) < 4):
     print "Usage: python {} url outfile parts".format (sys.argv[0])
     sys.exit (0)
 
@@ -38,7 +38,7 @@ thread.start ()
 
 # expecting -1 for failure, otherwise dict with filesize, duration
 message = mainqueue.get ()
-if (message == -1):
+if (message == FAIL):
     print "Download failed"
     sys.exit (1)
 print message
@@ -56,13 +56,13 @@ while (True):
     if ("status" in message):
         status = message["status"]
         
-        if (status == -1):
+        if (status == FAIL):
             print "\nDownload of part {} failed. Aborting...".format (part)
             progress[part] = "{:<9}".format ("Failed")
             break
-        elif (status == 1):
+        elif (status == SUCCESS):
             progress[part] = "{:<9}".format ("Done")
-        elif (status == 2):
+        elif (status == ALL_PARTS_DONE):
             # all parts finished; waiting to join files
             progress[part] = "{:<9}".format ("Done")
             print "\r" + " ".join (progress)

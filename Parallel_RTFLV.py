@@ -370,7 +370,7 @@ def save_stream (url_fn, filename, parts = 3,
         print_obj ("Filesize: " + str (message.get ("filesize") ) )
     
     if (debug):
-        print_obj ("Starting parts 1 - " + str (parts) )
+        print_obj ("Starting parts 1 - " + str (parts - 1) )
     # now that we have duration, we can start all other parts
     part_duration = duration / parts
     for i in range (1, parts):
@@ -435,7 +435,7 @@ def save_stream (url_fn, filename, parts = 3,
     for i in range (1, parts):
         part_filename = filename + ".part" + str (i)
         
-        partfile = open (part_filename, "r")
+        partfile = open (part_filename, "rb")
         shutil.copyfileobj (partfile, ofile)
         partfile.close ()
         if (debug):

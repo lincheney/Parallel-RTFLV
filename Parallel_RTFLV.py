@@ -1,13 +1,22 @@
 #
 #       Parallel_RTFLV:
-#       
+#
 #       API to download different parts of a real-time FLV
 #       stream in parallel (if this is possible) and
 #       finally join them.
-#       
+#
 #       In this way, a 1-hour video that would normally stream
 #       for 1-hour can be downloaded in three 20min downloads
 #       that occur in parallel.
+#       
+#       The use this, create a #MultiPart_Downloader, connect
+#       to the desired 'signals' and call #MultiPart_Downloader.save_stream()
+#       
+#       #MultiPart_Downloader has a basic 'GTK-like' interface for
+#       signals. Basically, you can 'connect' to them and 'emit' them.
+#       Signal handlers WILL block #MultiPart_Downloader.save_stream()
+#       For details on individual signals, see the documentation for
+#       the #MultiPart_Downloader class.
 #
 
 import os
@@ -15,28 +24,14 @@ import shutil
 import urllib2
 import struct
 import Queue
-from threading import Thread, Lock
+from threading import Thread
 
+# possible status values
+# %FAIL and %SUCCESS refer to downloading
 FAIL = -1
 SUCCESS = 1
-ALL_PARTS_DONE = 2
-
-print_lock = Lock ()
-
-#
-#       print_obj:
-#       @obj:           object to print
-#
-#       Prints @obj to stdout
-#       The function uses a lock so that only one
-#       print_obj() is printing at any time, otherwise
-#       the output of two threads printing at the same
-#       time may mix together.
-#
-def print_obj (obj):
-    print_lock.acquire ()
-    print obj
-    print_lock.release ()
+JOINING_STARTED = 2
+JOINING_FINISHED = 3
 
 #
 #       read_header:
@@ -116,334 +111,533 @@ def get_metadata_number (metadata, key):
     return struct.unpack ("!d", metadata[index : index + 8])[0]
 
 #
-#       save_stream_part:
-#       @url:           URL to open FLV stream
-#       @filename:      filename to save to
-#       @part:          which number part this is
-#       @inqueue:       #Queue to receive input from
-#       @outqueue:      #Queue to send output to
-#       @debug:         Print debug messages
-#
-#       Downloads a part of an FLV stream given in @url to
-#       @filename
+#       MultiPart_Downloader:
 #       
-#       The function will return if it receives FAIL on @inqueue.
-#       
-#       The function will put a dict on outqueue with:
-#               "part":         same as @part
-#       and where available,
-#               "offset":       timeBase value found in metadata
-#               "status":       one of FAIL, SUCCESS
-#               "progress":     value from 0 to 1 indicating progress
+#       Downloader for FLV-stream in multiple parts.
+#       This is achieved with the save_stream() method.
+#       To get debug messages, progress reports etc.,
+#       you can specify a callback in the connect() method
+#       for the 'signals' below.
 #
-def save_stream_part (url, filename, part, inqueue, outqueue, debug):
+class MultiPart_Downloader:
+    signals = [
+        #
+        #       ::debug:
+        #       @message:       the debug message
+        #       @part:          the part for this message, or None
+        #       
+        #       The ::debug signal is emitted when there is a debug
+        #       message available.
+        #       
+        #       Signal handler signature:
+        #       def user_function (message, part, ...)
+        #
+            "debug",
+        #
+        #       ::got-duration:
+        #       @duration:      duration
+        #       
+        #       Emitted when the total duration of the video is found
+        #       by the first part.
+        #       
+        #       Signal handler signature:
+        #       def user_function (duration, ...)
+        #
+            "got-duration",
+        #
+        #       ::got-filesize:
+        #       @filesize:      filesize
+        #       
+        #       Emitted when the filesize of the video is found by
+        #       the first part.
+        #       
+        #       Signal handler signature:
+        #       def user_function (filesize, ...)
+        #
+            "got-filesize",
+        #
+        #       ::part-finished:
+        #       @part:          the part that has finished
+        #       
+        #       Emitted when a part has finished downloading.
+        #       
+        #       Signal handler signature:
+        #       def user_function (part, ...)
+        #
+            "part-finished",
+        #
+        #       ::part-failed:
+        #       @part:          the part that failed
+        #       
+        #       Emitted when a part fails in downloading.
+        #       
+        #       Signal handler signature:
+        #       def user_function (part, ...)
+        #
+            "part-failed",
+        #
+        #       ::progress:
+        #       @progress:      progress of the download of @part;
+        #                       from 0-1
+        #       @part:          part
+        #       
+        #       Emitted when a part has download progress to report.
+        #       
+        #       Signal handler signature:
+        #       def user_function (progress, part, ...)
+        #
+            "progress",
+        #
+        #       ::status-changed:
+        #       @status:        status; one of FAIL, SUCCESS,
+        #                       JOINING_STARTED, JOINING_FINISHED
+        #       
+        #       Emitted when downloading fails (FAIL), downloading has
+        #       finished (SUCCESS), joining has started (JOINING_STARTED)
+        #       and joining has finished (JOINING_FINISHED)
+        #       
+        #       Signal handler signature:
+        #       def user_function (status, ...)
+        #
+            "status-changed",
+              ]
     #
-    #   debug_out:
-    #   @obj:           object to print
+    #   __init__:
+    #
+    def __init__ (self):
+        # signal handlers
+        self.handlers = dict ()
+        for i in self.signals:
+            self.handlers[i] = list ()
+        
+        # queue receiving input from threads
+        self.inqueue = Queue.Queue ()
+        # list of [thread, queue, done?] for each part
+        #       thread is the actual thread
+        #       queue sends output to thread
+        #       done indicates if the thread is finished (successfully)
+        self.threads = list ()
+    
+    #
+    #   connect:
+    #   @signal_name:           name of the signal
+    #   @handler:               callback to call when signal is emitted
+    #   @args:                  extra arguments to pass to @handler
+    #   @kwargs:                extra keyword args to pass to @handler
     #   
-    #   Prints debug msg with @obj with print_obj if @debug is True
-    #
-    def debug_out (obj):
-        if (debug):
-            print_obj ("Part " + str (part) + ": " + str (obj) )
-    
-    #
-    #   put_message:
-    #   @kwargs:        message
+    #   @handler will be called (with extra args in @args and @kwargs) when
+    #   the signal for @signal_name is emitted.
     #   
-    #   Puts the message given in the dict @kwargs to
-    #   outqueue, with part=part
+    #   Returns:                a handler id that can be used in disconnect()
     #
-    def put_message (**kwargs):
-        kwargs["part"] = part
-        outqueue.put (kwargs)
+    def connect (self, signal_name, handler, *args, **kwargs):
+        handler = (handler, args, kwargs)
+        self.handlers[signal_name].append (handler)
+        return handler
     
-    debug_out ("Started")
-    debug_out ("Opening " + url)
-    try:
-        stream = urllib2.urlopen (url)
-    except IOError as e:
-        debug_out ("Failed to open " + url)
-        debug_out (e)
-        put_message (status = FAIL)
-        return
+    #
+    #   disconnect:
+    #   @signal_name:           name of signal
+    #   @handler_id:            handler id obtained from connect()
+    #   
+    #   Disconnect the handler from the signal, so the handler will no longer
+    #   be called.
+    #
+    def disconnect (self, signal_name, handler_id):
+        for index, handler in enumerate (self.handlers[signal_name]):
+            # use 'is' to ensure it is an exact identity match
+            if (handler is handler_id):
+                self.handlers[signal_name].pop (index)
+                break
     
-    # get MIME of stream
-    stream_mime = stream.info ().gettype ()
-    if (stream_mime != "video/x-flv"):
-        # non-flv: fail
-        stream.close ()
-        debug_out ("{} is {}, not FLV".format (url, stream_mime) )
-        put_message (status = FAIL)
-        return
+    #
+    #   emit:
+    #   @signal_name:           name of signal to emit
+    #   @args:                  args
+    #   @kwargs:                keyword args
+    #   
+    #   'Emit' the signal for @signal_name. The handlers connected will
+    #   each be called in order. @args and @kwargs are arguments that
+    #   will be passed to EACH handler. The optional 'user_data' args
+    #   for each handler are only in addition to this.
+    #
+    def emit (self, signal_name, *args, **kwargs):
+        for function, a, kwa in self.handlers[signal_name]:
+            a = args + a
+            kwa.update (kwargs)
+            function (*a, **kwa)
     
-    outfile = open (filename, "wb")
-    debug_out ("Created file " + filename)
-    
-    # read the one header ...
-    header = read_header (stream)
-    if (header == None):
-        debug_out ("Incomplete FLV header")
-        put_message (status = FAIL)
-        return
-    debug_out ("Read FLV header")
-    # only part 0 will write the header
-    if (part == 0):
-        outfile.write (header)
-        debug_out ("Wrote FLV header")
-    
-    #offset specifies the absolute start of this part
-    offset = 0
-    # end_time specifies the absolute end of this part
-    end_time = float ("inf")
-    # duration specifies the relative end of this part
-    # given by (end_time - offset) * 1000
-    duration = float ("inf")
-    
-    tag_generator = read_tags (stream)
-    
-    # read first 2 tags
-    try:
-        # first tag - should have duration (and filesize) key
-        data, _type, timestamp, body = tag_generator.next ()
-        if (_type != "\x12"):
-            raise StopIteration
-        if (part == 0):
-            full_duration = get_metadata_number (body, "duration")
-            filesize = get_metadata_number (body, "filesize")
-            if (full_duration == None):
-                raise StopIteration
-            debug_out ("Found duration ({})".format (full_duration) )
-            put_message (duration = full_duration, filesize = filesize)
-            outfile.write (data)
-        
-        # second tag - should have timeBase key
-        data, _type, timestamp, body = tag_generator.next ()
-        if (_type != "\x12"):
-            raise StopIteration
-        offset = get_metadata_number (body, "timeBase")
-        if (offset == None):
-            raise StopIteration
-        debug_out ("Found timeBase ({})".format (offset) )
-        put_message (offset = offset)
-        
-        data = set_tag_timestamp (data, timestamp + offset * 1000)
-        outfile.write (data)
-    except StopIteration:
-        debug_out ("Metadata tag missing duration/timeBase key "
-                   "or no metadata found")
-        put_message (status = FAIL)
-        return
-    
-    # now get end_time
-    message = inqueue.get ()
-    if (message == FAIL):
-        # we've been told to stop, so fail
-        debug_out ("Ordered to stop")
-        outfile.close ()
-        stream.close ()
-        put_message (status = FAIL)
-        return
-    # otherwise, message is end_time
-    end_time = message
-    duration = (end_time - offset) * 1000
-    
-    debug_out ("Got end_time ({}), "
-               "new duration is ({})".format (end_time, duration) )
-    
-    # ... and read all the other tags
-    for data, _type, timestamp, body in tag_generator:
-        do_write = True
-        
-        if (_type == "\x08" and (ord (body[0]) >> 4) == 10):
-            # aac sequence header - only write if first part
-            do_write = (body[1] != "\x00")
-        elif (_type == "\x09" and (ord (body[0]) & 0xf) == 7):
-            # avc sequence header - only write if first part
-            do_write = (body[1] != "\x00")
-        
-        # write to file if first part or not sequence header
-        if (do_write or part == 0):
-            data = set_tag_timestamp (data, timestamp + offset * 1000)
-            outfile.write (data)
-        
-        # reached @duration ?
-        if (timestamp >= duration):
-            debug_out ("Finished at {}".format (duration) )
-            break
-        
-        # report progress for audio, video tags
-        if (_type == "\x08" or _type == "\x09"):
-            if (duration == float ("inf") ):
-                progress = 0
-            else:
-                progress = timestamp / duration
-            put_message (progress = progress)
-        
-        try:
-            message = inqueue.get_nowait ()
-            if (message == FAIL):
-                # we've been told to stop, so fail
-                debug_out ("Ordered to stop")
-                outfile.close ()
-                stream.close ()
-                put_message (status = FAIL)
-                return
-        except Queue.Empty:
-            pass
-    # finished reading all that's needed - success!
-    outfile.close ()
-    stream.close ()
-    debug_out ("Done")
-    put_message (status = SUCCESS)
-
-#
-#       save_stream:
-#       @url_fn:        function that returns a URL for a given seek-time
-#       @filename:      filename to save FLV to
-#       @parts:         number of parts in which to download FLV
-#       @mainqueue:     queue to put messages on
-#       @duration:      total duration of FLV to download
-#       @debug:         Print debug messages
-#
-#       Downloads the FLV stream from @url_fn in several parts and save to
-#       @filename.
-#       Specify @duration if not downloading full video.
-#       
-#       The function can optionally report progress/status to @mainqueue
-#       (in which case it should be threaded).
-#       
-#       The function will start part 0 first to obtain the full duration
-#       of the video. If this fails, the function aborts.
-#       Otherwise, it should receive a dict on inqueue with key "duration".
-#       The function will then start all other parts.
-#       Each of these parts should obtain a timeBase value in the second
-#       FLV tag and put this on inqueue with the key "offset". The timeBase
-#       of part X is the end_time of part X-1; the function will send
-#       the value on to part X-1 via a queue (unless X=0).
-#       
-#       If @mainqueue != None, the function will send all messages received
-#       on inqueue to through @mainqueue. They have the same format as for
-#       save_stream_part(), but "status" may also be ALL_PARTS_DONE
-#       
-#       The function will abort if any one part fails.
-#       
-#       If the download was successful, the partial files are joined
-#       into @filename (and then deleted).
-#
-def save_stream (url_fn, filename, parts = 3,
-                 mainqueue = None, duration = float ("inf"), debug = False):
-    # list of [thread, queue, finished?]
-    #   threads[x][0] is a thread
-    #   threads[x][1] is queue to communicate with thread
-    #   threads[x][2] is whether the thread is done
-    threads = list ()
-    # queue to receive input from
-    inqueue = Queue.Queue ()
-    
-    if (debug):
-        print_obj ("Starting part 0")
-    # start part 0 first to get duration
-    outqueue = Queue.Queue ()
-    # url for this part
-    part_url = url_fn (0)
-    thread = Thread (target = save_stream_part,
-                     args = (part_url, filename, 0,
-                             outqueue, inqueue, debug) )
-    threads.append ([thread, outqueue, False])
-    thread.daemon = True
-    thread.start ()
-    
-    # expecting first message with duration; error otherwise
-    message = inqueue.get ()
-    if ("duration" not in message):
-        if (debug):
-            print_obj ("Failed to get duration. Aborting")
-        if (mainqueue != None):
-            mainqueue.put (FAIL)
-        return
-    duration = min (message["duration"], duration)
-    if (mainqueue != None):
-        mainqueue.put ({"duration" : duration,
-                        "filesize" : message.get ("filesize")})
-    if (debug):
-        print_obj ("Filesize: " + str (message.get ("filesize") ) )
-    
-    if (debug):
-        print_obj ("Starting parts 1 - " + str (parts - 1) )
-    # now that we have duration, we can start all other parts
-    part_duration = duration / parts
-    for i in range (1, parts):
+    #
+    #   start_part_thread:
+    #   @part:                  part
+    #   @part_url:              url for this part
+    #   @filename:              base filename
+    #   
+    #   Start the downloading of the part @part in a separate thread.
+    #   If @part==0, the filename is @filename, otherwise it is
+    #   @filename.part3 for example, if @part==3
+    #
+    def start_part_thread (self, part, part_url, filename):
         outqueue = Queue.Queue ()
-        # url for this part
-        part_url = url_fn (i * part_duration)
-        part_filename = filename + ".part" + str (i)
-        thread = Thread (target = save_stream_part,
-                         args = (part_url, part_filename, i,
-                                 outqueue, inqueue, debug) )
-        threads.append ([thread, outqueue, False])
+        if (part == 0):
+            part_filename = filename
+        else:
+            part_filename = part_filename = filename + ".part" + str (part)
+        thread = Thread (target = self.save_stream_part,
+            args = (part_url, part_filename, part, outqueue, self.inqueue) )
+        self.threads.append ([thread, outqueue, False])
         thread.daemon = True
         thread.start ()
-    # last part should end at most at duration
-    # add 0.5 just in case
-    threads[-1][1].put (duration + 0.5)
     
-    # process loop, wait for messages on inqueue
-    while (True):
-        message = inqueue.get ()
-        part = message["part"]
+    #
+    #   save_stream_part:
+    #   @url:                   url to download
+    #   @filename:              filename to save to
+    #   @part:                  the number part this is
+    #   @inqueue:               queue to receive input
+    #   @outqueue:              queue to send output
+    #   
+    #   Downloads a part of the video stream given in @url and saves
+    #   to @filename.
+    #   The function will return if %FAIL is received on @inqueue.
+    #   The function will NEVER emit signals (since it is intended to
+    #   be threaded). Instead, it will pass them to @outqueue for
+    #   emission.
+    #   
+    #   The messages passed to @outqueue are all dictionaries.
+    #   The expected input/output of the function:
+    #   
+    #   1. Output a series of messages with keys "debug" and/or "filesize",
+    #           followed by a message with "duration" or a final message
+    #           with "status".
+    #
+    #   2. Wait for input on @inqueue that should either be %FAIL or the
+    #           absolute end time of this part.
+    #
+    #   3. Output EITHER a message with "offset" OR
+    #           a final message with "status".
+    #
+    #   4. Output a series of messages with keys "debug" and/or "progress",
+    #           followed by a final message with "status".
+    #
+    #   You can expect any message to potentially have "status" or "debug"
+    #   and a message with "status" will always be the last message.
+    #   In addition to all of the above, EVERY message will have a "part"
+    #   key.
+    #
+    def save_stream_part (self, url, filename, part, inqueue, outqueue):
+        #
+        #   put_message:
+        #   @kwargs:        message
+        #   
+        #   Puts the message given in the dict @kwargs to
+        #   outqueue, with part=part
+        #   Convenient function to output to @outqueue
+        #
+        def put_message (**kwargs):
+            kwargs["part"] = part
+            outqueue.put (kwargs)
         
-        if ("status" in message):
-            status = message["status"]
+        # try to open the url
+        put_message (debug = "Opening " + url)
+        try:
+            stream = urllib2.urlopen (url)
+        except IOError as e:
+            put_message (debug = "Failed to open {}: {}".format (url, e),
+                         status = FAIL)
+            return
+        
+        # get MIME of stream
+        stream_mime = stream.info ().gettype ()
+        if (stream_mime != "video/x-flv"):
+            # non-flv: fail
+            stream.close ()
+            put_message (debug = "{} is {}, not FLV".format (url, stream_mime),
+                         status = FAIL)
+            return
+        
+        outfile = open (filename, "wb")
+        put_message (debug = "Created file " + filename)
+        
+        # read the one header ...
+        header = read_header (stream)
+        if (header == None):
+            put_message (debug = "Incomplete FLV header", status = FAIL)
+            return
+        put_message (debug = "Read FLV header")
+        # only part 0 will write the header
+        if (part == 0):
+            outfile.write (header)
+            put_message (debug = "Wrote FLV header")
+        
+        #offset specifies the absolute start of this part
+        offset = 0
+        # end_time specifies the absolute end of this part
+        end_time = float ("inf")
+        # duration specifies the relative end of this part
+        # given by (end_time - offset) * 1000
+        duration = float ("inf")
+        
+        # generator that yields (data, _type, timestamp, body)
+        tag_generator = read_tags (stream)
+        
+        # read first 2 tags
+        try:
+            # first tag - should have duration (and filesize) key
+            data, _type, timestamp, body = tag_generator.next ()
+            # not metadata tag: fail
+            if (_type != "\x12"):
+                raise StopIteration
+            # only bother to extract duration/filesize if part 0
+            if (part == 0):
+                full_duration = get_metadata_number (body, "duration")
+                filesize = get_metadata_number (body, "filesize")
+                # no duration found: fail
+                if (full_duration == None):
+                    raise StopIteration
+                # output filesize if found
+                if (filesize != None):
+                    put_message (filesize = filesize)
+                put_message (duration = full_duration)
+                outfile.write (data)
             
-            # this part failed, so abort all
-            if (status == FAIL):
-                if (debug):
-                    print_obj ("Part {} failed. "
-                               "Stopping all parts".format (part) )
-                for i in threads:
-                    i[1].put (FAIL)
-                if (mainqueue != None):
-                    mainqueue.put (message)
+            # second tag - should have timeBase key
+            data, _type, timestamp, body = tag_generator.next ()
+            # not metadata tag: fail
+            if (_type != "\x12"):
+                raise StopIteration
+            offset = get_metadata_number (body, "timeBase")
+            # no timeBase: fail
+            if (offset == None):
+                raise StopIteration
+            put_message (debug = "Found timebase ({})".format (offset),
+                    offset = offset)
+            
+            data = set_tag_timestamp (data, timestamp + offset * 1000)
+            outfile.write (data)
+        except StopIteration:
+            # we ran out of tags or we explicitly raised StopIteration
+            #   because of some problem
+            put_message (debug = "Metadata tag missing duration/timeBase key"
+                    "or no metadata found", status = FAIL)
+            return
+        
+        # now get end_time
+        message = inqueue.get ()
+        if (message == FAIL):
+            # we've been told to stop, so fail
+            put_message (debug = "Ordered to stop")
+            outfile.close ()
+            stream.close ()
+            put_message (status = FAIL)
+            return
+        # otherwise, message is end_time
+        end_time = message
+        duration = (end_time - offset) * 1000
+        
+        put_message (debug = "Got end_time ({}), "
+                "new duration is ({})".format (end_time, duration) )
+        
+        # ... and read all the other tags
+        for data, _type, timestamp, body in tag_generator:
+            do_write = True
+            if (_type == "\x08" and (ord (body[0]) >> 4) == 10):
+                # aac sequence header - only write if first part
+                do_write = (body[1] != "\x00")
+            elif (_type == "\x09" and (ord (body[0]) & 0xf) == 7):
+                # avc sequence header - only write if first part
+                do_write = (body[1] != "\x00")
+            
+            # write to file if first part or not sequence header
+            if (do_write or part == 0):
+                data = set_tag_timestamp (data, timestamp + offset * 1000)
+                outfile.write (data)
+            
+            # reached @duration ?
+            if (timestamp >= duration):
+                put_message (debug = "Finished at {}".format (duration) )
+                break
+            
+            # report progress for audio, video tags
+            if (_type == "\x08" or _type == "\x09"):
+                if (duration == float ("inf") ):
+                    progress = 0
+                else:
+                    progress = timestamp / duration
+                put_message (progress = progress)
+            
+            # check if we've been told to stop
+            try:
+                message = inqueue.get_nowait ()
+                if (message == FAIL):
+                    # we've been told to stop, so fail
+                    put_message (debug = "Ordered to stop")
+                    outfile.close ()
+                    stream.close ()
+                    put_message (status = FAIL)
+                    return
+            except Queue.Empty:
+                pass
+        # finished reading all that's needed - success!
+        outfile.close ()
+        stream.close ()
+        put_message (debug = "Done", status = SUCCESS)
+    
+    #
+    #   stop_all_parts:
+    #   
+    #   Tell each of the 'part-threads' to stop and wait for them
+    #   to finish.
+    #
+    def stop_all_parts (self):
+        for thread, queue, done in self.threads:
+            queue.put (FAIL)
+        for thread, queue, done in self.threads:
+            thread.join ()
+    
+    #
+    #   save_stream:
+    #   @url_fn:        function that returns a URL for a given seek-time
+    #   @filename:      filename to save FLV to
+    #   @parts:         number of parts in which to download FLV
+    #   @duration:      total duration of FLV to download
+    #
+    #   Downloads the FLV stream from @url_fn in several parts and save to
+    #   @filename.
+    #   Specify @duration if not downloading full video.
+    #
+    #   This is the ONLY function that will emit signals (none of the threaded
+    #   save_stream_part() calls will).
+    #   
+    #   The function will start part 0 first to obtain the full duration
+    #   of the video. If this fails, the function aborts.
+    #   
+    #   Each of these parts should obtain a timeBase value in the second
+    #   FLV tag and put this on inqueue with the key "offset". The timeBase
+    #   of part X is the end_time of part X-1; the function will send
+    #   the value on to part X-1 via a queue (unless X=0).
+    #
+    #   The function will abort if any one part fails.
+    #
+    #   If the download was successful, the partial files are joined
+    #   into @filename (and then deleted).
+    #
+    def save_stream (self, url_fn, filename, parts, duration = float ("inf") ):
+        # reset thread list and inqueue
+        self.threads = list ()
+        self.inqueue = Queue.Queue ()
+        
+        # start part 0 first to get duration
+        self.emit ("debug", "Starting part 0", None)
+        part_url = url_fn (0)
+        self.start_part_thread (0, part_url, filename)
+        
+        # wait for a message with "duration" in it
+        # if "status" is found first, fail
+        # if "debug" or "filesize" is found, emit the appropriate signals
+        while (True):
+            message = self.inqueue.get ()
+            part = message["part"]
+            
+            # check if there is a debug message
+            # this is done first, in case there is also a status=FAIL
+            if ("debug" in message):
+                self.emit ("debug", message["debug"], part)
+            
+            # check for a status change; either way, we didn't
+            #   get duration, so fail
+            if ("status" in message):
+                self.emit ("debug", "Failed to get duration. Aborting", None)
+                self.emit ("status-changed", FAIL)
                 return
             
-            # this part is done, check if all others are done too
-            if (status == SUCCESS):
-                threads[part][2] = True
-                if (all (x[2] for x in threads) ):
-                    message["status"] = ALL_PARTS_DONE
-                    if (debug):
-                        print_obj ("All parts done")
-                    if (mainqueue != None):
-                        mainqueue.put (message)
-                    break
+            # check for filesize
+            filesize = message.get ("filesize")
+            if (filesize != None):
+                self.emit ("debug",
+                        "Found filesize ({})".format (filesize),
+                        None)
+                self.emit ("got-filesize", filesize)
+            
+            # check for duration; if found, we can start other threads
+            if ("duration" in message):
+                duration = min (message["duration"], duration)
+                self.emit ("debug",
+                        "Found duration ({})".format (message["duration"]),
+                        None)
+                self.emit ("got-duration", duration)
+                break
         
-        if ("offset" in message):
+        # now that we have duration, we can start all other parts
+        self.emit ("debug", "Starting parts 1 - " + str (parts - 1), None)
+        part_duration = duration / parts
+        for i in range (1, parts):
+            part_url = url_fn (i * part_duration)
+            self.start_part_thread (i, part_url, filename)
+        
+        # last part should end at most at duration
+        # add 0.5 just in case
+        self.threads[-1][1].put (duration + 0.5)
+        
+        # process loop, wait for messages on inqueue
+        while (True):
+            message = self.inqueue.get ()
+            part = message["part"]
+            
+            if ("debug" in message):
+                self.emit ("debug", message["debug"], part)
+            
+            if ("status" in message):
+                status = message["status"]
+                # this part failed, so abort all
+                if (status == FAIL):
+                    self.emit ("part-failed", part)
+                    self.emit ("status-changed", FAIL)
+                    self.emit ("debug", "Part {} failed."
+                               "Stopping all parts".format (part), None)
+                    self.stop_all_parts ()
+                    return
+                
+                # this part is done, check if all others are done too
+                if (status == SUCCESS):
+                    self.threads[part][2] = True
+                    self.emit ("part-finished", part)
+                    if (all (x[2] for x in self.threads) ):
+                        self.emit ("status-changed", status)
+                        self.emit ("debug", "All parts done", None)
+                        break
+            
+            if ("progress" in message):
+                self.emit ("progress", message["progress"], part)
+            
             # got an offset for part: this is end_time for part-1
-            if (part > 0):
-                threads[part - 1][1].put (message["offset"])
+            if ("offset" in message and part > 0):
+                offset = message["offset"]
+                self.threads[part - 1][1].put (offset)
+                self.emit ("debug",
+                        "Found timebase ({})".format (offset), part)
         
-        if (mainqueue != None):
-            mainqueue.put (message)
-    
-    if (debug):
-        print_obj ("Starting to join files")
-    # join all files and delete partials
-    # first part is contained in @filename
-    # others in @filename.partX
-    ofile = open (filename, "ab")
-    for i in range (1, parts):
-        part_filename = filename + ".part" + str (i)
-        
-        partfile = open (part_filename, "rb")
-        shutil.copyfileobj (partfile, ofile)
-        partfile.close ()
-        if (debug):
-            print_obj ("Appended part {} : {}".format (i, part_filename) )
-        
-        os.remove (part_filename)
-        if (debug):
-            print_obj ("Deleted  part {} : {}".format (i, part_filename) )
-    ofile.close ()
-    if (debug):
-        print_obj ("Joining done")
+        # finished downloading, start joining
+        self.emit ("status-changed", JOINING_STARTED)
+        self.emit ("debug", "Starting to join files", None)
+        # join all files and delete partials
+        # first part is contained in @filename
+        # others in @filename.partX
+        ofile = open (filename, "ab")
+        for i in range (1, parts):
+            part_filename = filename + ".part" + str (i)
+            
+            partfile = open (part_filename, "rb")
+            shutil.copyfileobj (partfile, ofile)
+            partfile.close ()
+            
+            self.emit ("debug",
+                    "Appended part {} : {}".format (i, part_filename), None)
+            
+            os.remove (part_filename)
+            self.emit ("debug",
+                    "Deleted part {} : {}".format (i, part_filename), None)
+        ofile.close ()
+        # finished joining - all done
+        self.emit ("status-changed", JOINING_FINISHED)
+        self.emit ("debug", "Joining done", None)

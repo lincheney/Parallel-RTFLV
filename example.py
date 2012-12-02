@@ -31,6 +31,7 @@ url_fn = lambda time: url + "&seek=" + str (time)
 
 # running stats for each part
 stat_strs = [""] * parts
+stat_printed = False
 
 #
 #       set_stats:
@@ -43,7 +44,14 @@ def set_stats (part, stat):
     stat_strs[part] = "P{:<2}:{:<6}".format (part, stat)
 
 # set initial progress to 0 for all parts
-[set_stats (part, 0) for part in range (parts)]
+for part in range (parts):
+    set_stats (part, 0)
+
+def check_stat_printed ():
+    global stat_printed
+    if (stat_printed):
+        print
+    stat_printed = False
 
 #
 #       print_stats:
@@ -51,15 +59,19 @@ def set_stats (part, stat):
 #       Prints progress/stats for each part
 #
 def print_stats ():
+    global stat_printed
     # print out the stats
     print "\r" + " ".join (stat_strs),
     sys.stdout.flush ()
+    stat_printed = True
 
 # various signal handlers
 def got_filesize (filesize):
+    check_stat_printed ()
     print "Filesize:", filesize
 
 def got_duration (duration):
+    check_stat_printed ()
     print "Duration:", duration
 
 def part_finished (part):
@@ -75,16 +87,18 @@ def print_progress (progress, part):
     print_stats ()
 
 def status_changed (status):
+    check_stat_printed ()    
     if (status == -1):
-        print "\nDownloading failed. Aborting"
+        print "Downloading failed. Aborting"
     elif (status == 1):
-        print "\nDownloading finished"
+        print "Downloading finished"
     elif (status == 2):
-        print "\nJoining files..."
+        print "Joining files..."
     elif (status == 3):
-        print "\nJoining finished"
+        print "Joining finished"
 
 def got_debug_message (message, part):
+    check_stat_printed ()
     if (part == None):
         sys.stderr.write (message + "\n")
     else:
@@ -99,7 +113,9 @@ else:
     downloader.connect ("got-filesize", got_filesize)
     downloader.connect ("part-finished", part_finished)
     downloader.connect ("part-failed", part_failed)
-    downloader.connect ("progress", print_progress)
     downloader.connect ("status-changed", status_changed)
+
+downloader.connect ("progress", print_progress)
+
 # download the video
 downloader.save_stream (url_fn, outfile, parts)

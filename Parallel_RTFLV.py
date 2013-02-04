@@ -15,11 +15,19 @@
 #       #MultiPart_Downloader has a basic 'GTK-like' interface for
 #       signals. Basically, you can 'connect' to them and 'emit' them.
 #       Signal handlers WILL block #MultiPart_Downloader.save_stream()
-#       For details on individual signals, see the documentation for
-#       the #MultiPart_Downloader class.
+#       
+#       The class has the following signals:
+#           "debug"             - debug messages
+#           "info"              - error & more important messages
+#           "got-duration"      - duration
+#           "got-filesize"      - filesize
+#           "part-failed"       - a part failed
+#           "part-finished"     - a part finished
+#           "progress"          - progress
 #
 
 import os
+import errno
 import shutil
 import urllib2
 import struct
@@ -30,12 +38,40 @@ from threading import Thread
 # %FAIL and %SUCCESS refer to downloading
 FAIL = -1
 SUCCESS = 1
-JOINING_STARTED = 2
-JOINING_FINISHED = 3
 
-#proxy = urllib2.ProxyHandler ({"http" : "103.4.16.203:3128"})
-#opener = urllib2.build_opener (proxy)
-#urllib2.install_opener (opener)
+#
+#   list_chunk:
+#   @l:                 a list
+#   @condition:         function
+#   
+#   Breaks up @l into contiguous 'chunks' where
+#   all elements of the chunk satisfy @condition
+#   e.g. @l = [1, 2, -1, -2, 3, -3, 0, 4, 5]
+#       @condition = lambda x: x > 0
+#       yields the following chunks:
+#           [1, 2], [3], [4, 5]
+#   
+#   Yields:             left index of chunk, right index of chunk, the chunk
+#
+def list_chunk (l, condition):
+    start = 0
+    while (start < len (l) ):
+        # next element to satisfy @condition
+        left = -1
+        for index, i in enumerate (l[start:]):
+            if (condition (index, i) ):
+                left = start + index
+                break
+        if (left == -1):
+            return
+        # next element to not satisfy @condition
+        right = len (l)
+        for index, i in enumerate (l[left:]):
+            if (not condition (index, i) ):
+                right = left + index
+                break
+        yield left, right, l[left:right]
+        start = right + 1
 
 #
 #       Tag:
@@ -64,21 +100,24 @@ class Tag:
         self.data = data
     
     #
-    #   is_audio_header:
+    #   is_header:
     #   
-    #   Returns:        True iff tag is AAC sequence header
+    #   Returns:        True iff tag is AAC or AVC sequence header
     #
-    def is_audio_hdr (self):
-        return self._type == Tag.AUDIO and (ord (self.body[0]) >> 4) == 10 and ord (self.body[1]) == 0
+    def is_header (self):
+        if (ord (self.body[1]) != 0):
+            return None
+        if (self._type == Tag.AUDIO and (ord (self.body[0]) >> 4) == 10):
+            return Tag.AUDIO
+        if (self._type == Tag.VIDEO and (ord (self.body[0]) & 0xf) == 7):
+            return Tag.VIDEO
+        return None
     
     #
-    #   is_video_header:
+    #   is_video_keyframe:
     #   
-    #   Returns:        True iff tag is AVC sequence header
+    #   Returns:        True iff tag is a video keyframe
     #
-    def is_video_hdr (self):
-        return self._type == Tag.VIDEO and (ord (self.body[0]) & 0xf) == 7 and ord (self.body[1]) == 0
-    
     def is_video_keyframe (self):
         return self._type == Tag.VIDEO and (ord (self.body[0]) >> 4) == 1
     
@@ -112,6 +151,17 @@ class Tag:
         fileobj.write (self.data[8 : ])
 
 #
+#   DataStream:
+#   
+#   A data stream keeping track of whether header for the stream
+#   is written yet and the timestamp of the last tag written for this stream.
+#
+class DataStream:
+    def __init__ (self, header_written):
+        self.header_written = header_written
+        self.last_timestamp = -1
+
+#
 #       StreamPart:
 #
 class StreamPart:
@@ -134,8 +184,22 @@ class StreamPart:
         
         self.is_lastpart = (self.part == numparts - 1)
         self.is_firstpart = (self.part == 0)
+        # need to write headers only if first part
+        self.data_streams = {Tag.AUDIO : DataStream (not self.is_firstpart),
+                            Tag.VIDEO : DataStream (not self.is_firstpart) }
+        # mapping from keyframe timestamps to file positions
+        self.keyframes = dict ()
+        # offset of current stream
+        self.offset = 0
+        # offset of start of this part
+        self.real_offset = None
+        # offset from where download is resumed (or started if could not resume)
+        self.start_time = None
+        
         self.thread = None
         self.done = False
+        self.need_start = None
+        self.need_end = None
     
     #
     #   put_message:
@@ -189,219 +253,325 @@ class StreamPart:
         #fullsize = struct.unpack ("!I", fullsize)[0]
         return Tag (_type, timestamp, body, data)
     
+    #
+    #   restart_from_last_keyframe:
+    #   
+    #   Attempt to open a stream on some keyframe in self.keyframes (starting from last keyframe)
+    #   
+    #   Returns:        None on failure or
+    #                   (stream, header, [tag1, tag2], offset)
+    #
+    def restart_from_last_keyframe (self):
+        for kf in sorted (self.keyframes.keys (), reverse = True):
+            result = self.open_stream (start = kf)
+            if (result is not None):
+                stream, header, mtags, offset = result
+                offset = round (offset)
+                if (offset in self.keyframes):
+                    # new stream starts at a known keyframe (which may or may not be kf)
+                    self.outfile.seek (self.keyframes[offset], 0)
+                    return result
+                # new stream doesn't start at the keyframe
+                self.put_message (info = "Stream starts at unknown keyframe {}".format (offset) )
+                stream.close ()
+        return None
     
     #
     #   open_stream:
-    #   @url:           URL to open
+    #   @start:         time at which to start
+    #   @analyse:       whether we are analysing a previous download
     #   
-    #   Opens FLV stream at @url and gets the header, first 2 metadata tags
-    #           and timeBase value in second metadata tag
-    #   This function is called by #StreamPart.save_stream_part_threaded()
+    #   Gets the header, first 2 metadata tags and timeBase value in second metadata tag from stream
+    #   If @analyse is false, stream is URL opened at @start
+    #   Otherwise, the stream is self.outfile (and @start is ignored)
+    #   
+    #   If @analyse is true and it is NOT the first part, the header, metadata etc. is not retrieved
+    #   All keyword arguments are optional; if @analyse is true, @start is ignored
     #   
     #   Returns:        None on failure or
     #                   (stream, header, [tag1, tag2], offset)
     #   
-    def open_stream (self, url):
-        # try to open the url
-        self.put_message (debug = "Opening " + url)
-        try:
-            stream = urllib2.urlopen (url)
-        except IOError as e:
-            self.put_message (debug = "Failed to open {}: {}".format (url, e), status = FAIL)
-            return None
+    def open_stream (self, start = 0, analyse = False):
+        # don't do anything if analysing and not first part
+        # first part needs to check for header + metadata
+        if (analyse and not self.is_firstpart):
+            return self.outfile, None, list (), None
         
-        # stream must be FLV
-        stream_mime = stream.info ().gettype ()
-        if (stream_mime != "video/x-flv"):
-            self.put_message (debug = "{} is {}, not FLV".format (url, stream_mime), status = FAIL)
-            stream.close ()
-            return None
+        if (analyse):
+            stream = self.outfile
+            error_key = "debug"
+        else:
+            error_key = "info"
+            url = self.url_fn (start / 1000.0)
+            # try to open the url
+            self.put_message (debug = "Opening " + url)
+            try:
+                stream = urllib2.urlopen (url)
+            except IOError as e:
+                self.put_message (info = "Failed to open {}: {}".format (url, e) )
+                return None
+        
+            # stream must be FLV
+            stream_mime = stream.info ().gettype ()
+            if (stream_mime != "video/x-flv"):
+                self.put_message (info = "{} is {}, not FLV".format (url, stream_mime) )
+                stream.close ()
+                return None
         
         # read the one header
         header = self.read_header (stream)
-        if (header == None):
-            self.put_message (debug = "Incomplete FLV header", status = FAIL)
-            stream.close ()
+        if (header is None):
+            self.put_message (**{error_key : "Incomplete FLV header"})
+            if (not analyse):
+                stream.close ()
             return None
         self.put_message (debug = "Read FLV header")
-        
-        mtags = list ()
+    
         # read first 2 metadata tags
+        mtags = list ()
         for i in range (2):
             tag = self.get_next_tag (stream)
-            if (tag == None or tag._type != Tag.METADATA):
-                self.put_message (debug = "Missing metadata", status = FAIL)
-                stream.close ()
+            if (tag is None or tag._type != Tag.METADATA):
+                self.put_message (**{error_key : "Missing metadata"})
+                if (not analyse):
+                    stream.close ()
                 return None
             mtags.append (tag)
-        
+    
         # second tag - should have timeBase key
         offset = mtags[1].get_metadata_number ("timeBase")
-        if (offset == None):
-            self.put_message (debug = "Metadata missing timeBase key", status = FAIL)
+        if (offset is None):
+            self.put_message (**{error_key : "Metadata missing timeBase key"})
+            if (not analyse):
+                stream.close ()
             return None
         offset *= 1000
-        self.put_message (debug = "Found timebase ({})".format (offset), offset = offset)
+        self.put_message (debug = "Found timebase ({})".format (offset) )
         
         return stream, header, mtags, offset
     
     #
-    #   save_stream_part:
-    #   @start_time:            time (in secs) to start downloading from
+    #   read_tag_stream:
+    #   @stream:            stream
+    #   @end_time:          time we want to end at
+    #   @analyse:           whether we are analysing a previous download
+    #   
+    #   Reads and yields tags from @stream; and also:
+    #       Checks if @stream has legitimately ended (e.g. with @end_time) (only for @analyse = false)
+    #       
+    #       Drops tags if their stream header not written or timestamp has not increased
+    #       
+    #       Offsets first tag back to a timestamp of 0 (@analyse=false) or sets self.offset to timestamp
+    #           of first tag
+    #   
+    #   If the @stream closes prematurely, a final None is yielded
+    #   All keyword arguments are optional; if @analyse is true, @end_time is ignored
+    #   
+    #   Yields:             #Tag
     #
-    #   Will start a thread for #StreamPart.save_stream_part_threaded()
-    #
-    def save_stream_part (self, start_time):
-        self.thread = Thread (target = self.save_stream_part_threaded, args = (start_time, ) )
-        self.thread.daemon = True
-        self.thread.start ()
+    def read_tag_stream (self, stream, end_time = 0, analyse = False):
+        found_first_tag = False
+        duration = int (round (end_time - self.offset) )
+        while (True):
+            tag = self.get_next_tag (stream)
+            if (tag is None):
+                # stream closed prematurely
+                yield None
+                return
+            
+            # check if stream should end (and @analyse is false)
+            if (not analyse):
+                # end of stream indicated with a bunch of dummy tags
+                # only interested if last part
+                if (tag.timestamp == 0 and tag._type == Tag.END and self.is_lastpart):
+                    missing = end_time - max (i.last_timestamp for i in self.data_streams.values () )
+                    self.put_message (info = "EOS - duration was off by {} msecs".format (missing) )
+                    break
+                
+                # downloaded as much as needed
+                if (tag.timestamp >= duration):
+                    if ((int (tag.timestamp) == duration and tag.is_video_keyframe () ) or self.is_lastpart):
+                        break
+                    elif (tag.timestamp > duration):
+                        # not last part and didn't find next part's key frame
+                        self.put_message (info = "Finished but not on expected keyframe")
+                        break
+            
+            # only include interesting tags
+            if (tag._type in self.data_streams):
+                # must be: header OR (header written AND timestamp increased)
+                if (tag.is_header () or (self.data_streams[tag._type].header_written and
+                        tag.timestamp + self.offset > self.data_streams[tag._type].last_timestamp) ):
+                    
+                    if (not tag.is_header () ):
+                        if (not found_first_tag):
+                            # found our first (non-header) tag
+                            found_first_tag = True
+                            if (analyse):
+                                self.offset = tag.timestamp
+                            else:
+                                self.offset -= tag.timestamp
+                                duration += int (tag.timestamp)
+                        self.data_streams[tag._type].last_timestamp = tag.timestamp + self.offset
+                    yield tag
     
     #
-    #   save_stream_part_threaded:
-    #   @start_time:            time (in secs) to start downloading from
+    #   analyse:
+    #   
+    #   Analyse a previous (incomplete) download saved in self.outfile
+    #   Basically fills in the self.keyframes dictionary
+    #   If first part, will also get the video duration (if possible)
+    #
+    def analyse (self):
+        try:
+            result = self.open_stream (analyse = True)
+            if (result is not None):
+                stream, header, mtags, offset = result
+                if (self.is_firstpart):
+                    # get the filesize, duration
+                    full_duration = mtags[0].get_metadata_number ("duration")
+                    if (full_duration is None):
+                        # no duration key; download is bad 
+                        self.put_message (info = "Metadata missing duration key", status = FAIL)
+                        return
+                    self.put_message (filesize = mtags[0].get_metadata_number ("filesize") )
+                    self.put_message (duration = full_duration)
+                
+                # fill in the self.keyframes dictionary
+                for tag in self.read_tag_stream (self.outfile, analyse = True):
+                    if (tag is None):
+                        continue
+                    if (tag.is_header () ):
+                        self.data_streams[tag._type].header_written = True
+                    elif (tag.is_video_keyframe () ):
+                        self.keyframes[tag.timestamp] = self.outfile.tell () - len (tag.data)
+        finally:
+            # seek back to start of file
+            self.outfile.seek (0, 0)
+    
+    #
+    #   save_stream_part:
+    #   @resume:                    whether to resume a previous download
     #
     #   Downloads a part of the video stream starting at @start_time and saves
-    #   to #StreamPart.outfile
+    #   to self.outfile
     #   
-    #   This function will return if %FAIL is received on #StreamPart.inqueue
+    #   This function will return if %FAIL is received on self.inqueue
     #
     #   This function will NEVER emit signals (since it is intended to be threaded)
-    #   Instead, it will pass appropriate messages to #StreamPart.outqueue for emission
+    #   Instead, it will pass appropriate messages to self.outqueue for emission
     #   These messages are all dictionaries
     #
-    #   If this is the first part, first message contains "duration"   
-    #   All parts then output a message with "offset" (absolute start time)
-    #   All parts then wait for the absolute end time (or %FAIL) of this part on #StreamPart.inqueue
+    #   If this is the first part, first message contains "duration"
+    #   All parts then output need_start = True (wait for a start time on self.inqueue) of
+    #       need_start = False (start time already obtained; self.start_time holds a valid number)
+    #
+    #   The stream will then be opened at self.start_time
+    #   All parts then output need_end = True, and wait for end_time on self.inqueue
     #   
-    #   The stream will then be downloaded and saved
-    #   If the stream closes prematurely, the function tries to start downloading
+    #   The stream is saved and it closes prematurely, the function tries to start downloading
     #   again from the point it left off
     #   
-    #   At any point, an output message may contain "debug" or "status"
+    #   At any point, an output message may contain "debug", "info" or "status"
     #   If the message contains "status", it will be the final message (indicating
     #   either %SUCCESS or %FAIL)
     #   In addition to all of the above, EVERY message will have a "part" key.
     #   
-    #   Tags are written in chunks: tags are queued up until a video keyframe is found,
-    #   and then written. If the stream closes prematurely, queued tags are dropped
-    #   and the stream restarts at the last keyframe
-    #
-    def save_stream_part_threaded (self, start_time):
-        url = self.url_fn (start_time)
-        result = self.open_stream (url)
-        if (result == None):
-            # couldn't open stream; fail
-            return
+    #   If @resume is true, will attempt to resume from a previous download.
+    #   
+    def save_stream_part (self, resume = False):
+        if (resume):
+            self.analyse ()
         
-        # offset - absolute start of this part
-        offset = 0
-        # end_time - absolute end of this part
-        end_time = float ("inf")
+        # attempt to resume
+        result = self.restart_from_last_keyframe ()
+        resume_failed = (result is None)
         
-        stream, header, mtags, offset = result
-        real_start = offset
+        if (not resume_failed):
+            # resume successful! set self.start_time
+            stream, header, mtags, self.offset = result
+            self.start_time = self.offset
+            self.put_message (info = "Resuming from {}".format (self.offset) )
+        elif (self.is_firstpart):
+            # no resume; first part always starts at 0
+            self.start_time = 0
+        
+        # indicate we need self.start_time or self.start_time is now a number
+        self.need_start = (self.start_time is None)
+        self.put_message (need_start = self.need_start)
+        
+        if (resume_failed):
+            if (self.need_start):
+                # wait for start_time
+                self.start_time = self.inqueue.get ()
+                if (self.start_time == FAIL):
+                    self.put_message (debug = "Ordered to stop", status = FAIL)
+                    return None
+                self.put_message (debug = "Got start_time ({})".format (self.start_time) )
+            
+            result = self.open_stream (start = self.start_time)
+            if (result is None):
+                # couldn't open stream; fail
+                self.put_message (status = FAIL)
+                return
+            stream, header, mtags, self.offset = result
+        
+        if (self.real_offset is None):
+            self.real_offset = self.offset
+        self.offset = int (round (self.offset) )
         
         # try statement only has a finally clause to close the stream
         try:
-            # only first part will write header
-            # and extract duration+filesize metadata
-            if (self.is_firstpart):
+            # only first part will write header and extract duration, filesize metadata
+            # if resume succeeded, its already been done
+            if (resume_failed and self.is_firstpart):
                 self.outfile.write (header)
                 self.put_message (debug = "Wrote FLV header")
                 
                 full_duration = mtags[0].get_metadata_number ("duration")
-                if (full_duration == None):
-                    self.put_message (debug = "Metadata missing duration key", status = FAIL)
+                if (full_duration is None):
+                    self.put_message (info = "Metadata missing duration key", status = FAIL)
                     return
                 self.put_message (filesize = mtags[0].get_metadata_number ("filesize"))
                 self.put_message (duration = full_duration)
-                
+            
                 mtags[0].write_data (self.outfile, 0)
                 mtags[1].write_data (self.outfile, 0)
             
+            # indicate we need an end_time
+            self.need_end = True
+            self.put_message (need_end = self.need_end)
             # now get end_time
-            message = self.inqueue.get ()
-            if (message == FAIL):
+            end_time = self.inqueue.get ()
+            if (end_time == FAIL):
                 self.put_message (debug = "Ordered to stop", status = FAIL)
                 return
-            # otherwise, message is end_time
-            end_time = message
             self.put_message (debug = "Got end_time ({})".format (end_time) )
-            
-            # only write headers for first part
-            write_audio_hdr = self.is_firstpart
-            write_video_hdr = self.is_firstpart
-            # list of tags starting with a video keyframe
-            tag_list = list ()
             
             # loop - keep going until WHOLE part downloaded (i.e. accounting for incomplete downloads)
             while (True):
-                # relative end of this part
-                duration = end_time - offset
-                
                 # timestamp for the last audio/video/keyframe tag received
-                last_audio_t = -1
-                last_video_t = -1
-                last_keyframe = offset
-                found_first_tag = False
+                self.data_streams[Tag.AUDIO].last_timestamp = -1
+                self.data_streams[Tag.VIDEO].last_timestamp = -1
                 
-                # loop - download + save the data
-                while (True):
-                    tag = self.get_next_tag (stream)
-                    if (tag == None):
-                        # stream closed prematurely
-                        break
-                    
-                    # end of stream indicated with a bunch of dummy tags
-                    # only interested if last part
-                    if (tag.timestamp == 0 and tag._type == Tag.END and self.is_lastpart):
-                        missing = duration - max (last_audio_t, last_video_t)
-                        self.put_message (debug = "EOS - missing {} msecs".format (missing) )
-                        break
-                    
-                    # downloaded as much as needed
-                    if (tag.timestamp >= duration):
-                        if (not self.is_lastpart and (tag.timestamp > duration or not tag.is_video_keyframe () ) ):
-                            # not last part and didn't find next part's key frame
-                            self.put_message (debug = "Finished but didn't end on expected keyframe")
-                        break
-                    
-                    write_tag = False
-                    if (tag.is_audio_hdr () or tag.is_video_hdr () ):
-                        # write sequeunce header if not already written
-                        if (write_audio_hdr and tag.is_audio_hdr () ):
-                            tag.write_data (self.outfile, offset)
-                            write_audio_hdr = False
-                        elif (write_video_hdr and tag.is_video_hdr () ):
-                            tag.write_data (self.outfile, offset)
-                            write_video_hdr = False
-                    else:
-                        # queue tag if its seq header already written and timestamp increased
-                        if (tag._type == Tag.AUDIO and not write_audio_hdr and tag.timestamp > last_audio_t):
-                            last_audio_t = tag.timestamp
-                            write_tag = True
-                        elif (tag._type == Tag.VIDEO and not write_video_hdr and tag.timestamp > last_video_t):
-                            last_video_t = tag.timestamp
-                            write_tag = True
-                        
-                        if (write_tag):
-                            # first tag - shift it back to 0
-                            if (not found_first_tag):
-                                found_first_tag = True
-                                offset -= tag.timestamp
-                                duration += tag.timestamp
-                            
-                            if (tag.is_video_keyframe () ):
-                                # found another key frame, write the queued tags
-                                for i in tag_list:
-                                    i.write_data (self.outfile, offset)
-                                tag_list = [tag]
-                                
-                                self.put_message (progress = (last_keyframe - real_start) / (end_time - real_start) )
-                                last_keyframe = tag.timestamp + offset
-                            else:
-                                # queue the tag
-                                tag_list.append (tag)
+                # read tags from stream
+                # at the end, tag is None if stream prematurely ended
+                tag = None
+                for tag in self.read_tag_stream (stream, end_time = end_time):
+                    if (tag is None):
+                        continue
+                    if (not tag.is_header () ):
+                        if (tag.is_video_keyframe () ):
+                            # new keyframe
+                            self.keyframes[round (tag.timestamp + self.offset)] = self.outfile.tell ()
+                            # report progrses
+                            self.put_message (progress = float (tag.timestamp + self.offset - self.real_offset) / (end_time - self.real_offset) )
+                        # write the tag
+                        tag.write_data (self.outfile, self.offset)
+                    elif (not self.data_streams[tag._type].header_written):
+                        # only write headers if not already written
+                        tag.write_data (self.outfile, self.offset)
+                        self.data_streams[tag._type].header_written = True
                     
                     # check if we've been ordered to stop
                     try:
@@ -414,35 +584,25 @@ class StreamPart:
                 
                 stream.close ()
                 # timestamp of last written tag
-                prev_t = max (last_audio_t, last_video_t) + offset
+                prev_t = max (i.last_timestamp for i in self.data_streams.values () )
                 
-                if (tag != None):
+                if (tag is not None):
                     # finished successfully
-                    # dump remaining tags to file
-                    for i in tag_list:
-                        i.write_data (self.outfile, offset)
                     break
                 
-                # otherwise: incomplete; restart stream at last keyframe
-                self.put_message (debug = "Incomplete at {}. Trying to get some more".format (last_keyframe) )
-                url = self.url_fn (max (0, last_keyframe / 1000.0) )
-                result = self.open_stream (url)
-                if (result == None):
+                # otherwise: incomplete; restart stream at last possible keyframe
+                self.put_message (info = "Incomplete at {}. Trying to get some more".format (prev_t) )
+                result = self.restart_from_last_keyframe ()
+                if (result is None):
                     # couldn't open stream; fail
+                    self.put_message (status = FAIL)
                     return
-                
-                stream, header, mtags, offset = result
-                # new stream doesn't start at the last keyframe; fail
-                if (offset != last_keyframe):
-                    self.put_message (debug = "Stream starts at wrong keyframe {}".format (offset), status = FAIL)
-                    return
-                tag_list = list ()
+                stream, header, mtags, self.offset = result
             
             # finished successfully!
             self.done = True
             self.put_message (progress = 1)
-            self.put_message (debug = "Finished at {}".format (prev_t) )
-            self.put_message (debug = "Done", status = SUCCESS)
+            self.put_message (debug = "Finished at {}".format (prev_t), status = SUCCESS)
         finally:
             stream.close ()
 
@@ -464,6 +624,15 @@ class MultiPart_Downloader:
         #       The ::debug signal is emitted when there is a debug message available.
         #
             "debug",
+        #
+        #       ::info:
+        #       @message:       the info message
+        #       @part:          the part for this message, or None
+        #       
+        #       The ::info signal is emitted when there is an info message available, i.e.
+        #       errors or other important messages
+        #
+            "info",
         #
         #       ::got-duration:
         #       @duration:      duration
@@ -500,14 +669,6 @@ class MultiPart_Downloader:
         #       Emitted when a part has download progress to report.
         #
             "progress",
-        #
-        #       ::status-changed:
-        #       @status:        status; one of %FAIL, %SUCCESS, %JOINING_STARTED, %JOINING_FINISHED
-        #       
-        #       Emitted when downloading fails (%FAIL), downloading has finished (%SUCCESS),
-        #       joining has started (%JOINING_STARTED) and joining has finished (%JOINING_FINISHED)
-        #
-            "status-changed",
               ]
     
     #
@@ -572,27 +733,79 @@ class MultiPart_Downloader:
             function (*a, **kwa)
     
     #
+    #   lock_file:
+    #   @name:          name
+    #   
+    #   Creates a lock file based on @name
+    #   Any call to lock_file() with the same @name will then fail (since the lock already exists)
+    #   even from other processes
+    #   
+    #   Returns:        None if failed to create lock file; or file-descriptor on success
+    #
+    def lock_file (self, name):
+        lockname = name + ".lock"
+        try:
+            fd = os.open (lockname, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0666)
+        except OSError as e:
+            if (e.errno == errno.EEXIST):
+                self.emit ("info", "Lock file already exists: " + lockname, None)
+                return None
+        else:
+            # success!
+            self.emit ("debug", "Created lock file: " + lockname, None)
+            return fd
+        self.emit ("info", "Could not create lock file for some reason: " + lockname, None)
+        return None
+    
+    #
+    #   unlock_file:
+    #   @name:          name
+    #   @fd:            file-descriptor of lock file
+    #   
+    #   Deletes the lock file. Calls to lock_file() can now succeed
+    #
+    def unlock_file (self, name, fd):
+        lockname = name + ".lock"
+        os.remove (lockname)
+        os.close (fd)
+        self.emit ("debug", "Lock file removed: " + lockname, None)
+    
+    #
     #   start_part_thread:
     #   @part:                  part
-    #   @start_time:            time at which to start this part
     #   @filename:              base filename
     #   @numparts:              total number of parts
     #   
     #   Start the downloading of the part @part in a separate thread.
     #   If @part==0, the filename is @filename, otherwise it is @filename.part3 for example, if @part==3
     #
-    def start_part_thread (self, part, start_time, filename, numparts):
+    def start_part_thread (self, part, filename, numparts, no_resume):
         outqueue = Queue.Queue ()
         if (part == 0):
             part_filename = filename
         else:
             part_filename = filename + ".part" + str (part)
-        # open the file too
-        outfile = open (part_filename, "wb")
+        # open the file
+        try:
+            outfile = open (part_filename, "r+b")
+            resumable = not no_resume
+        except IOError as e:
+            if (e.errno == 2):
+                # file does not exist; can't resume
+                outfile = open (part_filename, "wb")
+                resumable = False
+            else:
+                self.emit ("debug", "Failed to create file: {}".format (e) )
+                return False
+        
         self.emit ("debug", "Created file " + part_filename, None)
-        self.parts.append (StreamPart (outqueue, self.inqueue, part, outfile, self.url_fn, numparts) )
+        sp = StreamPart (outqueue, self.inqueue, part, outfile, self.url_fn, numparts)
+        self.parts.append (sp)
         # start the thread
-        self.parts[-1].save_stream_part (start_time)
+        sp.thread = Thread (target = sp.save_stream_part, kwargs = {"resume" : resumable} )
+        sp.thread.daemon = True
+        sp.thread.start ()
+        return True
     
     #
     #   stop_all_parts:
@@ -601,18 +814,42 @@ class MultiPart_Downloader:
     #
     def stop_all_parts (self):
         for i in self.parts:
-            i.queue.put (FAIL)
+            i.inqueue.put (FAIL)
         for i in self.parts:
-            if (i.thread != None):
+            if (i.thread is not None):
                 i.thread.join ()
             i.outfile.close ()
+    
+    #
+    #   wait_for_message:
+    #   @queue:             queue
+    #   
+    #   Convenience function.
+    #   Gets messages from @queue, performs default actions on "debug" and "info"
+    #   messages and returns whatever is left.
+    #   
+    #   Returns:            part, message, status
+    #
+    def wait_for_message (self, queue):
+        message = queue.get ()
+        part = message.pop ("part")
+        
+        if ("debug" in message):
+            self.emit ("debug", message.pop ("debug"), part)
+        if ("info" in message):
+            self.emit ("info", message.pop ("info"), part)
+        
+        status = message.pop ("status", None)
+        return part, message, status
     
     #
     #   save_stream:
     #   @url_fn:        function that returns a URL for a given seek-time
     #   @filename:      filename to save FLV to
-    #   @parts:         number of parts in which to download FLV
+    #   @numparts:      number of parts in which to download FLV
     #   @duration:      total duration of FLV to download
+    #   @no_resume:     don't resume previous downloads
+    #   @lock:          use lock file
     #
     #   Downloads the FLV stream from @url_fn in several parts and save to @filename.
     #   Specify @duration if not downloading full video.
@@ -622,115 +859,136 @@ class MultiPart_Downloader:
     #   The function will start part 0 first to obtain the full duration of the video.
     #   If this fails, the function aborts.
     #   
-    #   Each part should put a message on inqueue with the key "offset"
-    #   The "offset" of part X is the end_time of part X-1 and will be sent to
-    #   part X-1 via a queue (unless X==0)
+    #   Each part should put a message on inqueue with the key "need_start" (= True/False)
+    #   Once all parts have emitted this, those with (need_start = True) will receive a
+    #   start time on their inqueue.
+    #   
+    #   The same will then be done with "need_end"
     #
     #   The function will abort if any one part fails.
     #
     #   If the download was successful, the partial files are joined into @filename (and then deleted).
     #
-    def save_stream (self, url_fn, filename, parts, duration = float ("inf") ):
-        # reset thread list and inqueue
-        self.threads = list ()
-        self.inqueue = Queue.Queue ()
-        self.url_fn = url_fn
+    def save_stream (self, url_fn, filename, numparts, duration = float ("inf"), no_resume = False, lock = False):
+        if (lock):
+            lock_file_fd = self.lock_file (filename)
+            if (lock_file_fd is None):
+                return
         
-        # start part 0 first to get duration
-        self.emit ("debug", "Starting part 0", None)
-        self.start_part_thread (0, 0, filename, parts)
-        
-        # wait for a message with "duration" in it
-        while (True):
-            message = self.inqueue.get ()
-            part = message["part"]
+        # try has finally clause to remove lock file
+        try:
+            # reset thread list and inqueue
+            self.threads = list ()
+            self.inqueue = Queue.Queue ()
+            self.url_fn = url_fn
             
-            # check if there is a debug message
-            # this is done first, in case there is also a status=%FAIL
-            if ("debug" in message):
-                self.emit ("debug", message["debug"], part)
-            # check for a status change; either way, we didn't get duration, so fail
-            if ("status" in message):
-                self.emit ("debug", "Failed to get duration. Aborting", None)
-                self.stop_all_parts ()
-                self.emit ("status-changed", FAIL)
+            # start part 0 first to get duration
+            self.emit ("debug", "Starting part 0", None)
+            if (not self.start_part_thread (0, filename, numparts, no_resume) ):
+                self.emit ("part-failed", 0)
                 return
             
-            # check for filesize
-            filesize = message.get ("filesize")
-            if (filesize != None):
-                self.emit ("debug", "Found filesize ({})".format (filesize), None)
-                self.emit ("got-filesize", filesize)
-            
-            # check for duration; if found, we can start other threads
-            if ("duration" in message):
-                duration = min (message["duration"], duration)
-                self.emit ("debug", "Found duration ({})".format (message["duration"]), None)
-                self.emit ("got-duration", duration)
-                break
-        
-        # now that we have duration, we can start all other parts
-        self.emit ("debug", "Starting parts 1 - {}".format (parts - 1), None)
-        part_duration = float (duration) / parts
-        for i in range (1, parts):
-            self.start_part_thread (i, i * part_duration, filename, parts)
-        
-        # last part should end at most at duration
-        self.parts[-1].inqueue.put (duration * 1000)
-        
-        # process loop, wait for messages on inqueue
-        while (True):
-            message = self.inqueue.get ()
-            part = message["part"]
-            
-            if ("debug" in message):
-                self.emit ("debug", message["debug"], part)
-            
-            if ("status" in message):
-                status = message["status"]
-                # if this part failed, abort all
-                if (status == FAIL):
-                    self.parts[part].outfile.close ()
-                    self.emit ("part-failed", part)
-                    self.emit ("status-changed", FAIL)
-                    self.emit ("debug", "Part {} failed. Stopping all parts".format (part), None)
+            # wait for a message with "duration" in it
+            while (True):
+                part, message, status = self.wait_for_message (self.inqueue)
+                # check for a status change; either way, we didn't get duration, so fail
+                if (status is not None):
+                    self.emit ("info", "Failed to get duration. Aborting", None)
                     self.stop_all_parts ()
                     return
                 
-                # this part is done, check if all others are done too
-                if (status == SUCCESS):
-                    self.parts[part].outfile.close ()
-                    self.emit ("part-finished", part)
-                    if (all (x.done for x in self.parts) ):
-                        self.emit ("status-changed", status)
-                        self.emit ("debug", "All parts done", None)
-                        break
+                # check for filesize
+                filesize = message.get ("filesize")
+                if (filesize is not None):
+                    self.emit ("debug", "Found filesize ({})".format (filesize), None)
+                    self.emit ("got-filesize", filesize)
+                
+                # check for duration; if found, we can start other threads
+                if ("duration" in message):
+                    duration = min (message["duration"], duration)
+                    self.emit ("debug", "Found duration ({})".format (message["duration"]), None)
+                    self.emit ("got-duration", duration)
+                    break
             
-            if ("progress" in message):
-                self.emit ("progress", message["progress"], part)
+            # now that we have duration, we can start all other parts
+            self.emit ("debug", "Starting parts 1 - {}".format (numparts - 1), None)
+            for i in range (1, numparts):
+                if (not self.start_part_thread (i, filename, numparts, no_resume) ):
+                    self.emit ("part-failed", i)
+                    return
             
-            # got an offset for part: this is end_time for part-1
-            if ("offset" in message and part > 0):
-                offset = message["offset"]
-                self.parts[part - 1].inqueue.put (offset)
-                self.emit ("debug", "Found timebase ({})".format (offset), part)
-        
-        # finished downloading, start joining
-        self.emit ("status-changed", JOINING_STARTED)
-        self.emit ("debug", "Starting to join files", None)
-        # join all files and delete partials
-        # first part is contained in @filename, others in @filename.partX
-        with open (filename, "ab") as ofile:
-            for i in range (1, parts):
-                part_filename = filename + ".part" + str (i)
+            # process loop, wait for messages on inqueue
+            while (True):
+                part, message, status = self.wait_for_message (self.inqueue)
+                if (status is not None):
+                    # if this part failed, abort all
+                    if (status == FAIL):
+                        self.parts[part].outfile.close ()
+                        self.emit ("part-failed", part)
+                        self.emit ("info", "Part {} failed. Stopping all parts".format (part), None)
+                        self.stop_all_parts ()
+                        return
+                    
+                    # this part is done, check if all others are done too
+                    if (status == SUCCESS):
+                        self.parts[part].outfile.close ()
+                        self.emit ("part-finished", part)
+                        if (all (x.done for x in self.parts) ):
+                            self.emit ("info", "All parts finished downloading", None)
+                            break
                 
-                with open (part_filename, "rb") as partfile:
-                    shutil.copyfileobj (partfile, ofile)
+                if ("progress" in message):
+                    self.emit ("progress", message["progress"], part)
                 
-                self.emit ("debug", "Appended part {} : {}".format (i, part_filename), None)
+                if ("need_start" in message):
+                    # this part has figured out if it needs start_time
+                    # check if all other parts have too
+                    if (all (i.need_start is not None for i in self.parts) ):
+                        # get contiguous chunks of parts that need start_time
+                        for left, right, chunk in list_chunk (self.parts, lambda i, p: p.need_start):
+                            if (left == 0):
+                                left_time = 0
+                            else:
+                                left_time = self.parts[left - 1].start_time
+                            if (right == numparts):
+                                right_time = duration * 1000
+                            else:
+                                right_time = self.parts[right].real_offset
+                            
+                            part_duration = float (right_time - left_time) / (right - left + 1)
+                            # send a start time to each of them
+                            for index, p in enumerate (chunk):
+                                p.inqueue.put (left_time + (index + 1) * part_duration)
+                                p.need_start = False
                 
-                os.remove (part_filename)
-                self.emit ("debug", "Deleted part {} : {}".format (i, part_filename), None)
-        # finished joining - all done
-        self.emit ("status-changed", JOINING_FINISHED)
-        self.emit ("debug", "Joining done", None)
+                if ("need_end" in message):
+                    # this part has figured out if it needs end_time
+                    # check if all other parts have too
+                    if (all (i.need_end is not None for i in self.parts) ):
+                        for i in range (1, numparts):
+                            # offset of part X is end time of part X-1
+                            if (self.parts[i - 1].need_end):
+                                self.parts[i - 1].inqueue.put (self.parts[i].real_offset)
+                                self.parts[i - 1].need_end = False
+                        # last part should end at most at duration
+                        self.parts[-1].inqueue.put (duration * 1000)
+            
+            # finished downloading, start joining
+            self.emit ("info", "Starting to join files", None)
+            # join all files and delete partials
+            # first part is contained in @filename, others in @filename.partX
+            with open (filename, "ab") as ofile:
+                for i in range (1, numparts):
+                    part_filename = filename + ".part" + str (i)
+                    
+                    with open (part_filename, "rb") as partfile:
+                        shutil.copyfileobj (partfile, ofile)
+                    
+                    self.emit ("debug", "Appended part {} : {}".format (i, part_filename), None)
+                    os.remove (part_filename)
+                    self.emit ("debug", "Deleted part {} : {}".format (i, part_filename), None)
+            # finished joining - all done
+            self.emit ("info", "Joining done", None)
+        finally:
+            if (lock):
+                self.unlock_file (filename, lock_file_fd)

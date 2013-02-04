@@ -379,8 +379,24 @@ class StreamPart:
                 yield None
                 return
             
+            handled_tag = False
+            if (tag._type in self.data_streams):
+                if (tag.is_header () ):
+                    handled_tag = not self.data_streams[tag._type].header_written
+                else:
+                    handled_tag = (tag.timestamp + self.offset > self.data_streams[tag._type].last_timestamp)
+            
+            if (handled_tag and not tag.is_header () and not found_first_tag):
+                # found our first (non-header) tag
+                found_first_tag = True
+                if (analyse):
+                    self.offset = tag.timestamp
+                else:
+                    self.offset -= tag.timestamp
+                    duration += int (tag.timestamp)
+            
             # check if stream should end (and @analyse is false)
-            if (not analyse):
+            if (not analyse and not tag.is_header () ):
                 # end of stream indicated with a bunch of dummy tags
                 # only interested if last part
                 if (tag.timestamp == 0 and tag._type == Tag.END and self.is_lastpart):
@@ -397,23 +413,10 @@ class StreamPart:
                         self.put_message (info = "Finished but not on expected keyframe")
                         break
             
-            # only include interesting tags
-            if (tag._type in self.data_streams):
-                # must be: header OR (header written AND timestamp increased)
-                if (tag.is_header () or (self.data_streams[tag._type].header_written and
-                        tag.timestamp + self.offset > self.data_streams[tag._type].last_timestamp) ):
-                    
-                    if (not tag.is_header () ):
-                        if (not found_first_tag):
-                            # found our first (non-header) tag
-                            found_first_tag = True
-                            if (analyse):
-                                self.offset = tag.timestamp
-                            else:
-                                self.offset -= tag.timestamp
-                                duration += int (tag.timestamp)
-                        self.data_streams[tag._type].last_timestamp = tag.timestamp + self.offset
-                    yield tag
+            if (handled_tag):
+                if (not tag.is_header () ):
+                    self.data_streams[tag._type].last_timestamp = tag.timestamp + self.offset
+                yield tag
     
     #
     #   analyse:
@@ -556,22 +559,20 @@ class StreamPart:
                 
                 # read tags from stream
                 # at the end, tag is None if stream prematurely ended
+                incomplete = False
                 tag = None
                 for tag in self.read_tag_stream (stream, end_time = end_time):
                     if (tag is None):
-                        continue
-                    if (not tag.is_header () ):
-                        if (tag.is_video_keyframe () ):
-                            # new keyframe
-                            self.keyframes[round (tag.timestamp + self.offset)] = self.outfile.tell ()
-                            # report progrses
-                            self.put_message (progress = float (tag.timestamp + self.offset - self.real_offset) / (end_time - self.real_offset) )
-                        # write the tag
-                        tag.write_data (self.outfile, self.offset)
-                    elif (not self.data_streams[tag._type].header_written):
-                        # only write headers if not already written
-                        tag.write_data (self.outfile, self.offset)
+                        incomplete = True
+                        break
+                    tag.write_data (self.outfile, self.offset)
+                    if (tag.is_header () ):
                         self.data_streams[tag._type].header_written = True
+                    elif (tag.is_video_keyframe () ):
+                        # new keyframe
+                        self.keyframes[round (tag.timestamp + self.offset)] = self.outfile.tell ()
+                        # report progress
+                        self.put_message (progress = float (tag.timestamp + self.offset - self.real_offset) / (end_time - self.real_offset) )
                     
                     # check if we've been ordered to stop
                     try:
@@ -586,7 +587,7 @@ class StreamPart:
                 # timestamp of last written tag
                 prev_t = max (i.last_timestamp for i in self.data_streams.values () )
                 
-                if (tag is not None):
+                if (not incomplete):
                     # finished successfully
                     break
                 
@@ -605,6 +606,9 @@ class StreamPart:
             self.put_message (debug = "Finished at {}".format (prev_t), status = SUCCESS)
         finally:
             stream.close ()
+            # remove any trailing data
+            self.outfile.truncate (self.outfile.tell () )
+            self.outfile.close ()
 
 #
 #       MultiPart_Downloader:
@@ -923,7 +927,6 @@ class MultiPart_Downloader:
                 if (status is not None):
                     # if this part failed, abort all
                     if (status == FAIL):
-                        self.parts[part].outfile.close ()
                         self.emit ("part-failed", part)
                         self.emit ("info", "Part {} failed. Stopping all parts".format (part), None)
                         self.stop_all_parts ()
@@ -931,7 +934,6 @@ class MultiPart_Downloader:
                     
                     # this part is done, check if all others are done too
                     if (status == SUCCESS):
-                        self.parts[part].outfile.close ()
                         self.emit ("part-finished", part)
                         if (all (x.done for x in self.parts) ):
                             self.emit ("info", "All parts finished downloading", None)

@@ -391,6 +391,7 @@ class StreamPart:
                 found_first_tag = True
                 if (analyse):
                     self.offset = tag.timestamp
+                    self.real_offset = tag.timestamp
                 else:
                     self.offset -= tag.timestamp
                     duration += int (tag.timestamp)
@@ -490,14 +491,17 @@ class StreamPart:
         result = self.restart_from_last_keyframe ()
         resume_failed = (result is None)
         
-        if (not resume_failed):
+        if (resume_failed):
+            # no resume
+            self.real_offset = None
+            # first part always starts at 0
+            if (self.is_firstpart):
+                self.start_time = 0
+        else:
             # resume successful! set self.start_time
             stream, header, mtags, self.offset = result
             self.start_time = self.offset
             self.put_message (info = "Resuming from {}".format (self.offset) )
-        elif (self.is_firstpart):
-            # no resume; first part always starts at 0
-            self.start_time = 0
         
         # indicate we need self.start_time or self.start_time is now a number
         self.need_start = (self.start_time is None)

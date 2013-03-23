@@ -12,4 +12,4 @@ example.py contains an example command line program with usage:
 
 e.g. python example.py http://sbsauvod-f.akamaihd.net/... video.flv 5
 
-Windows 32-bit binary for v1.3.2 is at https://github.com/lincheney/Parallel-RTFLV/blob/gh-pages/RTFLV.zip
+Windows 32-bit binary for v1.3.2 is at https://github.com/lincheney/Parallel-RTFLV/raw/gh-pages/RTFLV.zip

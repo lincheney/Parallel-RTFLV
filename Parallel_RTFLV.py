@@ -574,7 +574,7 @@ class StreamPart:
                         self.data_streams[tag._type].header_written = True
                     elif (tag.is_video_keyframe () ):
                         # new keyframe
-                        self.keyframes[round (tag.timestamp + self.offset)] = self.outfile.tell ()
+                        self.keyframes[round (tag.timestamp + self.offset)] = self.outfile.tell () - len (tag.data)
                         # report progress
                         self.put_message (progress = float (tag.timestamp + self.offset - self.real_offset) / (end_time - self.real_offset) )
                     

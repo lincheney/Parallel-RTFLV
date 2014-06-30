@@ -655,9 +655,9 @@ class MultiPart_Downloader:
     #
     def __init__(self):
         # signal handlers
-        self.handlers = {}
+        self.callbacks = {}
         for i in self.signals:
-            self.handlers[i] = []
+            self.callbacks[i] = set()
         
         # queue receiving input from threads
         self.inqueue = Queue.Queue()
@@ -668,32 +668,29 @@ class MultiPart_Downloader:
     #
     #   connect:
     #   @signal_name:           name of the signal
-    #   @handler:               callback to call when signal is emitted
+    #   @callback:              callback to call when signal is emitted
     #   @args:                  extra arguments to pass to @handler
     #   @kwargs:                extra keyword args to pass to @handler
     #   
-    #   @handler will be called (with extra args in @args and @kwargs) when
+    #   @callback will be called (with extra args in @args and @kwargs) when
     #   the signal for @signal_name is emitted.
     #   
     #   Returns:                a handler id that can be used in disconnect()
     #
-    def connect(self, signal_name, handler, *args, **kwargs):
-        handler = (handler, args, kwargs)
-        self.handlers[signal_name].append(handler)
-        return handler
+    def connect(self, signal_name, callback, *args, **kwargs):
+        callback = functools.partial(callback, *args, **kwargs)
+        self.callbacks[signal_name].add(callback)
+        return callback
     
     #
     #   disconnect:
     #   @signal_name:           name of signal
-    #   @handler_id:            handler id obtained from connect()
+    #   @callback:              callback id obtained from connect()
     #   
-    #   Disconnect the handler from the signal, so the handler will no longer be called.
+    #   Disconnect the callback from the signal, so the handler will no longer be called.
     #
-    def disconnect(self, signal_name, handler_id):
-        for index, handler in enumerate(self.handlers[signal_name]):
-            if handler is handler_id:
-                self.handlers[signal_name].pop(index)
-                break
+    def disconnect(self, signal_name, callback):
+        self.callbacks[signal_name].remove(callback)
     
     #
     #   emit:
@@ -701,15 +698,13 @@ class MultiPart_Downloader:
     #   @args:                  args
     #   @kwargs:                keyword args
     #   
-    #   'Emit' the signal for @signal_name. The handlers connected will each be called
+    #   'Emit' the signal for @signal_name. The callbacks connected will each be called
     #   in order. @args and @kwargs are arguments that will be passed to EACH handler.
     #   The optional 'user_data' args for each handler are only in addition to this.
     #
     def emit(self, signal_name, *args, **kwargs):
-        for function, a, kwa in self.handlers[signal_name]:
-            a = args + a
-            kwa.update(kwargs)
-            function(*a, **kwa)
+        for callback in self.callbacks[signal_name]:
+            callback(*args, **kwargs)
     
     #
     #   lock_file:

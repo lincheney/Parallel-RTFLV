@@ -183,6 +183,14 @@ class StreamPart:
         self.outqueue.put(kwargs)
     
     #
+    #   convenience functions to put info, debug messages on outqueue
+    #
+    def info_message(self, info, **kwargs):
+        self.put_message(info = info, **kwargs)
+    def debug_message(self, debug, **kwargs):
+        self.put_message(debug = debug, **kwargs)
+    
+    #
     #       read_header:
     #       @stream:        stream
     #       
@@ -191,8 +199,9 @@ class StreamPart:
     #
     def read_header(self, stream):
         # header, tag size
-        header = stream.read(9 + 4)
-        if len(header) != 13:
+        length = 9 + 4
+        header = stream.read(length)
+        if len(header) != length:
             return None
         return header
 
@@ -206,8 +215,9 @@ class StreamPart:
     #
     def get_next_tag(self, stream):
         # type, size, timestamp, streamid
-        data = stream.read(1 + 3 + 4 + 3)
-        if len(data) != 11:
+        length = 1 + 3 + 4 + 3
+        data = stream.read(length)
+        if len(data) != length:
             return None
         
         _type = ord(data[0])
@@ -243,7 +253,7 @@ class StreamPart:
                     self.outfile.seek(self.keyframes[offset], 0)
                     return result
                 # new stream doesn't start at the keyframe
-                self.put_message(info = "Stream starts at unknown keyframe {}".format(offset) )
+                self.info_message("Stream starts at unknown keyframe {}".format(offset) )
                 stream.close()
         return None
     
@@ -270,40 +280,40 @@ class StreamPart:
         
         if analyse:
             stream = self.outfile
-            error_key = "debug"
+            on_error = self.debug_message
         else:
-            error_key = "info"
+            on_error = self.info_message
             url = self.url_fn(start / 1000.0)
             # try to open the url
-            self.put_message(debug = "Opening " + url)
+            self.debug_message("Opening " + url)
             try:
                 stream = urllib2.urlopen(url)
             except IOError as e:
-                self.put_message(info = "Failed to open {}: {}".format(url, e) )
+                self.info_message("Failed to open {}: {}".format(url, e) )
                 return None
         
             # stream must be FLV
             stream_mime = stream.info().gettype()
             if stream_mime != "video/x-flv":
-                self.put_message(info = "{} is {}, not FLV".format(url, stream_mime) )
+                self.info_message("{} is {}, not FLV".format(url, stream_mime) )
                 stream.close()
                 return None
         
         # read the one header
         header = self.read_header(stream)
         if header is None:
-            self.put_message(**{error_key : "Incomplete FLV Header"})
+            on_error("Incomplete FLV Header")
             if not analyse:
                 stream.close()
             return None
-        self.put_message(debug = "Read FLV header")
+        self.debug_message("Read FLV header")
     
         # read first 2 metadata tags
         mtags = []
         for i in range(2):
             tag = self.get_next_tag(stream)
             if tag is None or tag._type != Tag.METADATA:
-                self.put_message(**{error_key : "Missing metadata"})
+                on_error("Missing metadata")
                 if not analyse:
                     stream.close()
                 return None
@@ -312,12 +322,12 @@ class StreamPart:
         # second tag - should have timeBase key
         offset = mtags[1].get_metadata_number("timeBase")
         if offset is None:
-            self.put_message(**{error_key : "Metadata missing timeBase key"})
+            on_error("Metadata missing timeBase key")
             if not analyse:
                 stream.close()
             return None
         offset *= 1000
-        self.put_message(debug = "Found timebase ({})".format(offset) )
+        self.debug_message("Found timebase ({})".format(offset) )
         
         return stream, header, mtags, offset
     
@@ -373,7 +383,7 @@ class StreamPart:
                 # only interested if last part
                 if tag.timestamp == 0 and tag._type == Tag.END and self.is_lastpart:
                     missing = end_time - max(i.last_timestamp for i in self.data_streams.values() )
-                    self.put_message(info = "EOS - duration was off by {} msecs".format(missing) )
+                    self.info_message("EOS - duration was off by {} msecs".format(missing) )
                     break
                 
                 # downloaded as much as needed
@@ -382,7 +392,7 @@ class StreamPart:
                         break
                     elif tag.timestamp > duration:
                         # not last part and didn't find next part's key frame
-                        self.put_message(info = "Finished but not on expected keyframe")
+                        self.info_message("Finished ({}) but not on expected keyframe ({})".format(tag.timestamp, duration) )
                         break
             
             if handled_tag:
@@ -407,7 +417,7 @@ class StreamPart:
                     full_duration = mtags[0].get_metadata_number("duration")
                     if full_duration is None:
                         # no duration key; download is bad 
-                        self.put_message(info = "Metadata missing duration key", status = Status.FAIL)
+                        self.info_message("Metadata missing duration key", status = Status.FAIL)
                         return
                     self.put_message(filesize = mtags[0].get_metadata_number("filesize") )
                     self.put_message(duration = full_duration)
@@ -472,7 +482,7 @@ class StreamPart:
             # resume successful! set self.start_time
             stream, header, mtags, self.offset = result
             self.start_time = self.offset
-            self.put_message(info = "Resuming from {}".format(self.offset) )
+            self.info_message("Resuming from {}".format(self.offset) )
         
         # indicate we need self.start_time or self.start_time is now a number
         self.need_start = (self.start_time is None)
@@ -483,9 +493,9 @@ class StreamPart:
                 # wait for start_time
                 self.start_time = self.inqueue.get()
                 if self.start_time == Status.FAIL:
-                    self.put_message(debug = "Ordered to stop", status = Status.FAIL)
+                    self.debug_message("Ordered to stop", status = Status.FAIL)
                     return None
-                self.put_message(debug = "Got start_time ({})".format(self.start_time) )
+                self.debug_message("Got start_time ({})".format(self.start_time) )
             
             result = self.open_stream(start = self.start_time)
             if result is None:
@@ -504,11 +514,11 @@ class StreamPart:
             # if resume succeeded, its already been done
             if resume_failed and self.is_firstpart:
                 self.outfile.write(header)
-                self.put_message(debug = "Wrote FLV header")
+                self.debug_message("Wrote FLV header")
                 
                 full_duration = mtags[0].get_metadata_number("duration")
                 if full_duration is None:
-                    self.put_message(info = "Metadata missing duration key", status = Status.FAIL)
+                    self.info_message("Metadata missing duration key", status = Status.FAIL)
                     return
                 self.put_message(filesize = mtags[0].get_metadata_number("filesize") )
                 self.put_message(duration = full_duration)
@@ -522,9 +532,9 @@ class StreamPart:
             # now get end_time
             end_time = self.inqueue.get()
             if end_time == Status.FAIL:
-                self.put_message(debug = "Ordered to stop", status = Status.FAIL)
+                self.debug_message("Ordered to stop", status = Status.FAIL)
                 return
-            self.put_message(debug = "Got end_time ({})".format(end_time) )
+            self.debug_message("Got end_time ({})".format(end_time) )
             
             # loop - keep going until WHOLE part downloaded (i.e. accounting for incomplete downloads)
             while True:
@@ -553,7 +563,7 @@ class StreamPart:
                     try:
                         message = self.inqueue.get_nowait()
                         if message == Status.FAIL:
-                            self.put_message(debug = "Ordered to stop", status = Status.FAIL)
+                            self.debug_message("Ordered to stop", status = Status.FAIL)
                             return
                     except Queue.Empty:
                         pass
@@ -567,7 +577,7 @@ class StreamPart:
                     break
                 
                 # otherwise: incomplete; restart stream at last possible keyframe
-                self.put_message(info = "Incomplete at {}. Trying to get some more".format(prev_t) )
+                self.info_message("Incomplete at {}. Trying to get some more".format(prev_t) )
                 result = self.restart_from_last_keyframe()
                 if result is None:
                     # couldn't open stream; fail
@@ -578,7 +588,7 @@ class StreamPart:
             # finished successfully!
             self.done = True
             self.put_message(progress = 1)
-            self.put_message(debug = "Finished at {}".format(prev_t), status = Status.SUCCESS)
+            self.debug_message("Finished at {}".format(prev_t), status = Status.SUCCESS)
         finally:
             stream.close()
             # remove any trailing data
